@@ -32,6 +32,9 @@
   ==============================================================================
 */
 
+// LynCo P002: the app can handle device-list changes before JUCE closes or reopens a device.
+#define JUCE_AUDIO_DEVICE_MANAGER_HAS_OWNER_CONTROLLED_LIST_CHANGES 1
+
 namespace juce
 {
 
@@ -89,6 +92,13 @@ public:
 
     /** Destructor. */
     ~AudioDeviceManager() override;
+
+    /** Installs an owner for audio-device-list changes. When installed, the
+        handler runs synchronously before any automatic device-manager mutation.
+        Passing an empty handler restores JUCE's legacy recovery behaviour. The
+        handler must not re-enter this AudioDeviceManager. */
+    using AudioDeviceListChangeHandler = std::function<void (bool currentDeviceStillAvailable)>;
+    void setAudioDeviceListChangeHandler (AudioDeviceListChangeHandler);
 
     //==============================================================================
     /**
@@ -532,6 +542,11 @@ private:
     MidiDeviceInfo defaultMidiOutputDeviceInfo;
     std::unique_ptr<MidiOutput> defaultMidiOutput;
     CriticalSection audioCallbackLock, midiCallbackLock;
+
+    // Serialises installation/clearing with an already-entered list callback.
+    // The handler contract forbids manager re-entry while this lock is held.
+    CriticalSection deviceListChangeHandlerLock;
+    AudioDeviceListChangeHandler deviceListChangeHandler;
 
     std::unique_ptr<AudioBuffer<float>> testSound;
     int testSoundPosition = 0;

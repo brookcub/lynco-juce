@@ -76,6 +76,15 @@ enum
 
 const char* const javaAudioTypeName = "Android Audio";
 
+static CriticalSection audioRecordCallbacksLock;
+static AudioIODeviceType::AndroidAudioRecordCallbacks audioRecordCallbacks;
+
+void AudioIODeviceType::setAndroidAudioRecordCallbacks (AndroidAudioRecordCallbacks callbacks)
+{
+    const ScopedLock sl (audioRecordCallbacksLock);
+    audioRecordCallbacks = std::move (callbacks);
+}
+
 //==============================================================================
 class AndroidAudioIODevice final : public AudioIODevice,
                                    public Thread
@@ -242,6 +251,14 @@ public:
                                                                             ENCODING_PCM_16BIT,
                                                                             (jint) (minBufferSizeIn * numDeviceInputChannels * static_cast<int> (sizeof (int16))))));
 
+                {
+                    const ScopedLock sl (audioRecordCallbacksLock);
+                    inputCallbacks = audioRecordCallbacks;
+                }
+
+                if (inputDevice != nullptr && inputCallbacks.beforeStart)
+                    inputCallbacks.beforeStart (env, inputDevice.get());
+
                 int inputDeviceState = env->CallIntMethod (inputDevice, AudioRecord.getState);
                 if (inputDeviceState > 0)
                 {
@@ -262,7 +279,12 @@ public:
                 env->CallVoidMethod (outputDevice, AudioTrack.play);
 
             if (inputDevice != nullptr)
+            {
                 env->CallVoidMethod (inputDevice, AudioRecord.startRecording);
+
+                if (inputCallbacks.afterStart)
+                    inputCallbacks.afterStart (env, inputDevice.get());
+            }
 
             startThread (Priority::high);
         }
@@ -416,6 +438,7 @@ private:
     String lastError;
     BigInteger activeOutputChans, activeInputChans;
     GlobalRef outputDevice, inputDevice;
+    AudioIODeviceType::AndroidAudioRecordCallbacks inputCallbacks;
     AudioBuffer<float> inputChannelBuffer, outputChannelBuffer;
     jmethodID getUnderrunCount = nullptr;
 
@@ -430,10 +453,15 @@ private:
 
         if (inputDevice != nullptr)
         {
+            if (inputCallbacks.beforeStop)
+                inputCallbacks.beforeStop (getEnv(), inputDevice.get());
+
             inputDevice.callVoidMethod (AudioRecord.stop);
             inputDevice.callVoidMethod (AudioRecord.release);
             inputDevice.clear();
         }
+
+        inputCallbacks = {};
     }
 
     JUCE_DECLARE_NON_COPYABLE (AndroidAudioIODevice)

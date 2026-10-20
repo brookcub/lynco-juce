@@ -237,7 +237,7 @@ public:
             {
                 numDeviceInputChannels = jmin (numClientInputChannels, numDeviceInputChannelsAvailable);
                 inputDevice = GlobalRef (LocalRef<jobject> (env->NewObject (AudioRecord, AudioRecord.constructor,
-                                                                            0 /* (default audio source) */, sampleRate,
+                                                                            numDeviceInputChannels > 1 ? 9 /* UNPROCESSED */ : 0 /* DEFAULT */, sampleRate,
                                                                             numDeviceInputChannels > 1 ? CHANNEL_IN_STEREO : CHANNEL_IN_MONO,
                                                                             ENCODING_PCM_16BIT,
                                                                             (jint) (minBufferSizeIn * numDeviceInputChannels * static_cast<int> (sizeof (int16))))));

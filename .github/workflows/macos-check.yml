@@ -1,0 +1,35 @@
+name: macos-check
+
+# Builds and runs JUCE's UnitTestRunner on macOS, so the CoreAudio backend (which cannot be
+# built on Windows) is compiled and its unit tests run. Triggered by pushes to this branch only.
+on:
+  push:
+    branches: [ci/macos-check]
+
+jobs:
+  audio-tests:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          command -v ninja || brew install ninja
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DJUCE_BUILD_EXTRAS=ON
+
+      # UnitTestRunner links juce_audio_devices, so this compiles juce_CoreAudio_mac.cpp too.
+      - name: Build UnitTestRunner
+        shell: bash
+        run: cmake --build build --target UnitTestRunner 2>&1 | tee build.log
+
+      - name: Warnings in the files this branch changes
+        run: grep -E "warning:" build.log | grep -E "juce_CoreAudio_mac|juce_CallbackTimeHelpers" || true
+
+      # The runner exits non-zero if any test fails, which fails the job.
+      - name: Run the Audio tests
+        run: |
+          app=$(find build -name UnitTestRunner -type f -perm -u+x | head -n 1)
+          if [ -z "$app" ]; then app=$(find build -path '*UnitTestRunner.app/Contents/MacOS/UnitTestRunner' | head -n 1); fi
+          echo "Running $app"
+          "$app" --category=Audio

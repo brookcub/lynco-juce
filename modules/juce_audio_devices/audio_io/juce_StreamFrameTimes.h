@@ -95,6 +95,15 @@ class StreamFrameTimeTests final : public UnitTest
 public:
     StreamFrameTimeTests() : UnitTest ("Stream frame times", UnitTestCategories::audio) {}
 
+private:
+    static auto timestamp (int64_t framePosition, int64_t timeNs)
+    {
+        return [=] (int64_t& positionOut, int64_t& timeOut) { positionOut = framePosition; timeOut = timeNs; return true; };
+    }
+
+    static auto frame (int64_t frameIndex)    { return [=] { return frameIndex; }; }
+
+public:
     void runTest() override
     {
         // At 48 kHz, 48 frames last 1 ms and 480 frames last 10 ms.
@@ -168,13 +177,6 @@ public:
     }
 
 private:
-    static auto timestamp (int64_t framePosition, int64_t timeNs)
-    {
-        return [=] (int64_t& positionOut, int64_t& timeOut) { positionOut = framePosition; timeOut = timeNs; return true; };
-    }
-
-    static auto frame (int64_t frameIndex)    { return [=] { return frameIndex; }; }
-
     static String describe (std::optional<uint64_t> time)   { return time.has_value() ? String (*time) : String ("no time"); }
 
     void expectTime (std::optional<uint64_t> actual, std::optional<uint64_t> expected)

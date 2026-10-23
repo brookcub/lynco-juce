@@ -136,7 +136,8 @@ static String getOboeString (const Type& value)
 }
 
 //==============================================================================
-class OboeAudioIODevice final : public AudioIODevice
+class OboeAudioIODevice final : public AudioIODevice,
+                               private AsyncUpdater
 {
 public:
     //==============================================================================
@@ -254,16 +255,16 @@ public:
     }
 
     void close() override                               { stop(); }
-    int getOutputLatencyInSamples() override            { return session->getOutputLatencyInSamples(); }
-    int getInputLatencyInSamples() override             { return session->getInputLatencyInSamples(); }
+    int getOutputLatencyInSamples() override            { return session != nullptr ? session->getOutputLatencyInSamples() : 0; }
+    int getInputLatencyInSamples() override             { return session != nullptr ? session->getInputLatencyInSamples() : 0; }
     bool isOpen() override                              { return deviceOpen; }
     int getCurrentBufferSizeSamples() override          { return actualBufferSize; }
-    int getCurrentBitDepth() override                   { return session->getCurrentBitDepth(); }
+    int getCurrentBitDepth() override                   { return session != nullptr ? session->getCurrentBitDepth() : 0; }
     BigInteger getActiveOutputChannels() const override { return activeOutputChans; }
     BigInteger getActiveInputChannels() const override  { return activeInputChans; }
     String getLastError() override                      { return lastError; }
     bool isPlaying() override                           { return callback.get() != nullptr; }
-    int getXRunCount() const noexcept override          { return session->getXRunCount(); }
+    int getXRunCount() const noexcept override          { return session != nullptr ? session->getXRunCount() : -1; }
 
     int getDefaultBufferSize() override
     {
@@ -311,6 +312,10 @@ public:
 
     void stop() override
     {
+        // An error noted before this stop is out of date: whatever it broke is gone.
+        pendingStreamError = oboe::Result::OK;
+        cancelPendingUpdate();
+
         if (session != nullptr)
             session->stop();
 
@@ -453,6 +458,67 @@ private:
             for (int i = 0; i < numOutputChannels; ++i)
                 zeromem (outputChannelData[i], (size_t) (numFrames) * sizeof (float));
         }
+    }
+
+    //==============================================================================
+    /*  Oboe reports a failed stream on its own error thread, where the device must not be
+        stopped and reopened or the app called. The session hands the error to streamFailed(),
+        which only records it and asks for the message thread. There the device is stopped and,
+        after a disconnect, reopened with the settings it had, through the same stop(), open()
+        and start() that an app would use: the callback hears audioDeviceStopped(), then either
+        audioDeviceAboutToStart() on the reopened device, or audioDeviceError().
+
+        The audio callback cannot race this. The failed output stream was closed by Oboe before
+        the error was reported, so it is not running, and the streams are only destroyed by the
+        session's stop(), which holds the session's audioCallbackMutex.
+    */
+    void streamFailed (oboe::Result error)
+    {
+        // Keep the first error until the message thread has dealt with it.
+        auto expected = oboe::Result::OK;
+        pendingStreamError.compare_exchange_strong (expected, error);
+
+        triggerAsyncUpdate();
+    }
+
+    void handleAsyncUpdate() override
+    {
+        const auto error = pendingStreamError.exchange (oboe::Result::OK);
+        auto* callbackToRestore = callback.get();
+
+        // The device was stopped, or opened again, after the error was noted.
+        if (error == oboe::Result::OK || callbackToRestore == nullptr)
+            return;
+
+        const auto inputChannels  = activeInputChans;
+        const auto outputChannels = activeOutputChans;
+        const auto rate           = (double) sampleRate;
+        const auto bufferSize     = actualBufferSize;
+
+        start (nullptr);
+
+        String message;
+
+        if (error == oboe::Result::ErrorDisconnected)
+        {
+            message = open (inputChannels, outputChannels, rate, bufferSize);
+
+            if (message.isEmpty())
+            {
+                start (callbackToRestore);
+                return;
+            }
+
+            message = "Unable to reopen the audio device after it was disconnected: " + message;
+        }
+        else
+        {
+            message = "Audio stream error: " + getOboeString (error);
+        }
+
+        deviceOpen = false;
+        lastError = message;
+        callbackToRestore->audioDeviceError (message);
     }
 
     //==============================================================================
@@ -967,20 +1033,8 @@ private:
 
             JUCE_OBOE_LOG ("Oboe stream onErrorAfterClose(): " + getOboeString (error));
 
-            const SpinLock::ScopedTryLockType streamRestartLock { streamRestartMutex };
-
-            if (! streamRestartLock.isLocked())
-                return;
-
-            const SpinLock::ScopedLockType audioCallbackLock { audioCallbackMutex };
-
-            destroyStreams();
-
-            if (error != oboe::Result::ErrorDisconnected)
-                return;
-
-            openStreams();
-            start();
+            // This is Oboe's error thread: leave the recovery to the device, on the message thread.
+            owner.streamFailed (error);
         }
 
         void destroyStreams()
@@ -992,7 +1046,7 @@ private:
         std::vector<SampleType> inputStreamNativeBuffer;
         AudioBuffer<float> inputStreamSampleBuffer,
                            outputStreamSampleBuffer;
-        SpinLock audioCallbackMutex, streamRestartMutex;
+        SpinLock audioCallbackMutex;
 
         bool isInputLatencyDetectionSupported = false;
         int inputLatency = -1;
@@ -1022,6 +1076,8 @@ private:
     std::unique_ptr<OboeSessionBase> session;
 
     bool running = false;
+
+    std::atomic<oboe::Result> pendingStreamError { oboe::Result::OK };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (OboeAudioIODevice)
 };

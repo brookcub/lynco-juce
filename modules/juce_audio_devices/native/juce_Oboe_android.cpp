@@ -441,16 +441,21 @@ private:
     }
 
     void process (const float* const* inputChannelData, int numInputChannels,
-                  float* const* outputChannelData, int numOutputChannels, int32_t numFrames)
+                  float* const* outputChannelData, int numOutputChannels, int32_t numFrames,
+                  std::optional<uint64_t> outputTime, std::optional<uint64_t> inputTime)
     {
         if (auto* cb = callback.exchange (nullptr))
         {
+            // As the callback context defines them: with no outputs the callback's time is the input's.
+            const auto hostTime = numOutputChannels > 0 ? outputTime : inputTime;
+            const auto pointerTo = [] (const std::optional<uint64_t>& time) { return time.has_value() ? &*time : nullptr; };
+
             cb->audioDeviceIOCallbackWithContext (inputChannelData,
                                                   numInputChannels,
                                                   outputChannelData,
                                                   numOutputChannels,
                                                   numFrames,
-                                                  {});
+                                                  { pointerTo (hostTime), pointerTo (inputTime) });
             callback.set (cb);
         }
         else
@@ -891,6 +896,8 @@ private:
                 // only output stream should be the master stream receiving callbacks
                 jassert (stream->getDirection() == oboe::Direction::Output && stream == outputStream->getNativeStream().get());
 
+                std::optional<uint64_t> inputTime, outputTime;
+
                 // Read input from Oboe
                 const auto expandedBufferSize = jmax (inputStreamNativeBuffer.size(),
                                                       static_cast<size_t> (numInputChannels * jmax (bufferSize, numFrames)));
@@ -924,6 +931,13 @@ private:
                         JUCE_OBOE_LOG ("Failed to read from input stream: " + getOboeString (result.error()));
                     }
 
+                    // The frames just read end at getFramesRead(), which is after the read.
+                    inputTime = getInputBlockTimeNs (areDeviceTimesSupported,
+                                                     [&] (int64_t& position, int64_t& time) { return getTimestamp (*nativeInputStream, position, time); },
+                                                     [&] { return nativeInputStream->getFramesRead(); },
+                                                     result ? (int64_t) result.value() : 0,
+                                                     nativeInputStream->getSampleRate());
+
                     if (isInputLatencyDetectionSupported)
                         inputLatency = getLatencyFor (*inputStream);
                 }
@@ -937,11 +951,21 @@ private:
                 if (! referringDirectlyToOboeData)
                     outputStreamSampleBuffer.clear();
 
+                // This callback's first output frame is the next one to be written: the stream
+                // counts the frames of a callback only after the callback has returned.
+                if (numOutputChannels > 0)
+                {
+                    outputTime = getStreamFrameTimeNs (areDeviceTimesSupported,
+                                                       [&] (int64_t& position, int64_t& time) { return getTimestamp (*stream, position, time); },
+                                                       [&] { return stream->getFramesWritten(); },
+                                                       stream->getSampleRate());
+                }
+
                 // Process
                 // NB: the number of samples read from the input can potentially differ from numFrames.
                 owner.process (inputStreamSampleBuffer.getArrayOfReadPointers(), numInputChannels,
                                outputStreamSampleBuffer.getArrayOfWritePointers(), numOutputChannels,
-                               numFrames);
+                               numFrames, outputTime, inputTime);
 
                 // Write output to Oboe
                 if (! referringDirectlyToOboeData)
@@ -970,6 +994,11 @@ private:
                  + "\nBytesPerSample = " + (stream != nullptr ? String (stream->getBytesPerSample()) : String ("?"))
                  + "\nPerformanceMode = " + (stream != nullptr ? getOboeString (stream->getPerformanceMode()) : String ("?"))
                  + "\ngetDeviceId = " + (stream != nullptr ? String (stream->getDeviceId()) : String ("?")));
+        }
+
+        static bool getTimestamp (oboe::AudioStream& stream, int64_t& framePosition, int64_t& timeNs)
+        {
+            return stream.getTimestamp (CLOCK_MONOTONIC, &framePosition, &timeNs) == oboe::Result::OK;
         }
 
         int getLatencyFor (OboeStream& stream)
@@ -1050,6 +1079,9 @@ private:
         AudioBuffer<float> inputStreamSampleBuffer,
                            outputStreamSampleBuffer;
         SpinLock audioCallbackMutex;
+
+        // Oboe advises against calling getTimestamp() from a data callback before Android 11 (R)
+        const bool areDeviceTimesSupported = android_get_device_api_level() >= 30;
 
         bool isInputLatencyDetectionSupported = false;
         int inputLatency = -1;

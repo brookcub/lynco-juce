@@ -71,6 +71,7 @@
 #include "midi_io/ump/juce_UMPEndpoints.cpp"
 
 #include "audio_io/juce_SampleRateHelpers.cpp"
+#include "audio_io/juce_StreamFrameTimes.h"
 #include "midi_io/juce_MidiDevices.cpp"
 
 //==============================================================================

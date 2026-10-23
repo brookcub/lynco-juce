@@ -2027,24 +2027,65 @@ public:
         if (clip.isEmpty())
             return;
 
-        auto sizeNeeded = clip.getWidth() * clip.getHeight();
+        // Normally the whole clip is painted through one buffer. If the Java heap can't hold a
+        // buffer that large, the clip is painted in horizontal strips small enough to allocate.
+        // If not even a single row can be allocated, this frame is skipped, and the next one
+        // starts again from a buffer for its whole clip.
+        auto stripHeight = clip.getHeight();
 
-        if (t.sizeAllocated < sizeNeeded)
+        while (! t.ensureBufferSize (env, clip.getWidth() * stripHeight))
         {
-            t.buffer.clear();
-            t.sizeAllocated = sizeNeeded;
-            t.buffer = GlobalRef (LocalRef<jobject> ((jobject) env->NewIntArray (sizeNeeded)));
+            if (stripHeight == 1)
+            {
+                t.sizeFailed = 0;
+                return;
+            }
+
+            stripHeight = (stripHeight + 1) / 2;
         }
 
+        for (auto y = clip.getY(); y < clip.getBottom(); y += stripHeight)
+            paintArea (env, t, canvas, paint, { clip.getX(), y, clip.getWidth(), jmin (stripHeight, clip.getBottom() - y) });
+    }
+
+    // Returns true if the buffer holds at least numInts. Returns false, with no Java exception
+    // left pending, if it can't be allocated; a size that has failed once isn't tried again.
+    bool ensureBufferSize (JNIEnv* env, int numInts)
+    {
+        if (sizeAllocated >= numInts)
+            return true;
+
+        if (sizeFailed != 0 && numInts >= sizeFailed)
+            return false;
+
+        buffer.clear();
+        sizeAllocated = 0;
+
+        LocalRef<jobject> array ((jobject) env->NewIntArray (numInts));
+
+        if (env->ExceptionCheck() || array == nullptr)
+        {
+            env->ExceptionClear();
+            sizeFailed = numInts;
+            return false;
+        }
+
+        buffer = GlobalRef (array);
+        sizeAllocated = numInts;
+        return true;
+    }
+
+    static void paintArea (JNIEnv* env, AndroidComponentPeer& t, jobject canvas, jobject paint, Rectangle<int> area)
+    {
         if (jint* dest = env->GetIntArrayElements ((jintArray) t.buffer.get(), nullptr))
         {
             {
-                Image temp (new PreallocatedImage (clip.getWidth(), clip.getHeight(),
+                Image temp (new PreallocatedImage (area.getWidth(), area.getHeight(),
                                                    dest, ! t.component.isOpaque()));
 
                 {
                     LowLevelGraphicsSoftwareRenderer g (temp);
-                    g.setOrigin (-clip.getPosition());
+                    g.setOrigin (-area.getPosition());
                     const auto scale = Desktop::getInstance().getDisplays().getPrimaryDisplay()->scale
                                      / Desktop::getInstance().getGlobalScaleFactor();
                     g.addTransform (AffineTransform::scale ((float) scale));
@@ -2054,9 +2095,9 @@ public:
 
             env->ReleaseIntArrayElements ((jintArray) t.buffer.get(), dest, 0);
 
-            env->CallVoidMethod (canvas, AndroidCanvas.drawBitmap, (jintArray) t.buffer.get(), 0, clip.getWidth(),
-                                 (jfloat) clip.getX(), (jfloat) clip.getY(),
-                                 clip.getWidth(), clip.getHeight(), true, paint);
+            env->CallVoidMethod (canvas, AndroidCanvas.drawBitmap, (jintArray) t.buffer.get(), 0, area.getWidth(),
+                                 (jfloat) area.getX(), (jfloat) area.getY(),
+                                 area.getWidth(), area.getHeight(), true, paint);
         }
     }
 
@@ -2542,7 +2583,7 @@ private:
 
     GlobalRef view, viewGroup, buffer, activityWindow;
     bool userDidSupplyParent = false, fullScreen = false, navBarsHidden = false;
-    int sizeAllocated = 0;
+    int sizeAllocated = 0, sizeFailed = 0;
 
     //==============================================================================
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AndroidComponentPeer)

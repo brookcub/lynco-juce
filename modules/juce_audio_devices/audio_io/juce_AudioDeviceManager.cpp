@@ -84,7 +84,8 @@ bool AudioDeviceManager::AudioDeviceSetup::operator!= (const AudioDeviceManager:
 
     As a workaround, this class will ensure that the render callback will only
     ever be called with a block with a length less than or equal to the
-    expected block size.
+    expected block size. The times in the context belong to the first sample
+    of the device's block, so each later block gets them advanced by its offset.
 */
 class CallbackMaxSizeEnforcer  : public AudioIODeviceCallback
 {
@@ -95,6 +96,7 @@ public:
     void audioDeviceAboutToStart (AudioIODevice* device) override
     {
         maximumSize = device->getCurrentBufferSizeSamples();
+        sampleRate = device->getCurrentSampleRate();
         storedInputChannels .resize ((size_t) device->getActiveInputChannels() .countNumberOfSetBits());
         storedOutputChannels.resize ((size_t) device->getActiveOutputChannels().countNumberOfSetBits());
 
@@ -117,6 +119,12 @@ public:
         {
             const auto blockLength = jmin (maximumSize, numSamples - position);
 
+            const auto offsetNs = sampleRate > 0.0 ? (uint64_t) std::llround ((double) position * 1.0e9 / sampleRate)
+                                                   : (uint64_t) 0;
+            uint64_t hostTime = 0, inputHostTime = 0;
+            const AudioIODeviceCallbackContext blockContext { advance (context.hostTimeNs, offsetNs, hostTime),
+                                                              advance (context.inputHostTimeNs, offsetNs, inputHostTime) };
+
             const auto addOffset = [position] (auto ptr) { return ptr + position; };
             std::transform (inputChannelData,  inputChannelData  + numInputChannels,  storedInputChannels .begin(), addOffset);
             std::transform (outputChannelData, outputChannelData + numOutputChannels, storedOutputChannels.begin(), addOffset);
@@ -126,7 +134,7 @@ public:
                                                     storedOutputChannels.data(),
                                                     (int) storedOutputChannels.size(),
                                                     blockLength,
-                                                    context);
+                                                    blockContext);
 
             position += blockLength;
         }
@@ -138,10 +146,20 @@ public:
     }
 
 private:
+    static const uint64_t* advance (const uint64_t* time, uint64_t offsetNs, uint64_t& storage)
+    {
+        if (time == nullptr || offsetNs == 0)
+            return time;
+
+        storage = *time + offsetNs;
+        return &storage;
+    }
+
     std::vector<const float*> storedInputChannels;
     std::vector<float*> storedOutputChannels;
     AudioIODeviceCallback& inner;
     int maximumSize = 0;
+    double sampleRate = 0.0;
 };
 
 //==============================================================================
@@ -1728,6 +1746,79 @@ public:
             ptr->restartDevices (newSr, newBs);
             expectEquals (numCalls, 1);
         }
+
+        beginTest ("A callback longer than the buffer size is split, and each block gets the time of its own first sample");
+        {
+            // 512 samples at 48 kHz last 10,666,666.67 ns
+            const auto blocks = deliverOneCallback (48000.0, 512, 1024, 5'000'000'000u, 4'990'000'000u);
+
+            expectEquals ((int) blocks.size(), 2);
+
+            if (blocks.size() == 2)
+            {
+                expectEquals (blocks[0].numSamples, 512);
+                expectEquals (blocks[1].numSamples, 512);
+
+                expect (blocks[0].host  == 5'000'000'000u);
+                expect (blocks[0].input == 4'990'000'000u);
+                expect (blocks[1].host  == 5'010'666'667u);
+                expect (blocks[1].input == 5'000'666'667u);
+            }
+        }
+
+        beginTest ("A split callback without times passes no times to any block");
+        {
+            const auto blocks = deliverOneCallback (48000.0, 512, 1024, std::nullopt, std::nullopt);
+
+            expectEquals ((int) blocks.size(), 2);
+
+            for (const auto& block : blocks)
+            {
+                expect (! block.host.has_value());
+                expect (! block.input.has_value());
+            }
+        }
+
+        beginTest ("A split callback with only one of the two times keeps the other null");
+        {
+            const auto onlyHost = deliverOneCallback (48000.0, 512, 1024, 5'000'000'000u, std::nullopt);
+            expectEquals ((int) onlyHost.size(), 2);
+
+            if (onlyHost.size() == 2)
+            {
+                expect (onlyHost[0].host == 5'000'000'000u);
+                expect (onlyHost[1].host == 5'010'666'667u);
+                expect (! onlyHost[0].input.has_value());
+                expect (! onlyHost[1].input.has_value());
+            }
+
+            const auto onlyInput = deliverOneCallback (48000.0, 512, 1024, std::nullopt, 4'990'000'000u);
+            expectEquals ((int) onlyInput.size(), 2);
+
+            if (onlyInput.size() == 2)
+            {
+                expect (! onlyInput[0].host.has_value());
+                expect (! onlyInput[1].host.has_value());
+                expect (onlyInput[0].input == 4'990'000'000u);
+                expect (onlyInput[1].input == 5'000'666'667u);
+            }
+        }
+
+        beginTest ("The time of a split block is rounded to the nearest nanosecond");
+        {
+            // 512 / 44100 s = 11,609,977.32... ns and 1024 / 44100 s = 23,219,954.64... ns
+            const auto at44100 = deliverOneCallback (44100.0, 512, 1536, 1'000'000'000u, 1'000'000'000u);
+            expectEquals ((int) at44100.size(), 3);
+
+            if (at44100.size() == 3)
+            {
+                expect (at44100[0].host == 1'000'000'000u);
+                expect (at44100[1].host == 1'011'609'977u);
+                expect (at44100[2].host == 1'023'219'955u);
+                expect (at44100[1].input == 1'011'609'977u);
+                expect (at44100[2].input == 1'023'219'955u);
+            }
+        }
     }
 
 private:
@@ -1917,7 +2008,7 @@ private:
         StringArray getInputChannelNames()  override { return { "i1", "i2", "i3" }; }
 
         Array<double> getAvailableSampleRates() override { return { 44100.0, 48000.0 }; }
-        Array<int> getAvailableBufferSizes() override { return { 128, 256 }; }
+        Array<int> getAvailableBufferSizes() override { return { 128, 256, 512 }; }
         int getDefaultBufferSize() override { return 128; }
 
         String open (const BigInteger& inputs, const BigInteger& outputs, double sr, int bs) override
@@ -1958,6 +2049,22 @@ private:
 
         int getOutputLatencyInSamples() override { return 0; }
         int getInputLatencyInSamples() override { return 0; }
+
+        // Emulates the device calling back with one block of silence.
+        void deliver (int numSamples, const AudioIODeviceCallbackContext& context)
+        {
+            std::vector<std::vector<float>> inData  ((size_t) inChannels .countNumberOfSetBits(), std::vector<float> ((size_t) numSamples));
+            std::vector<std::vector<float>> outData ((size_t) outChannels.countNumberOfSetBits(), std::vector<float> ((size_t) numSamples));
+            std::vector<const float*> inPointers;
+            std::vector<float*> outPointers;
+
+            for (auto& channel : inData)  inPointers .push_back (channel.data());
+            for (auto& channel : outData) outPointers.push_back (channel.data());
+
+            callback->audioDeviceIOCallbackWithContext (inPointers.data(),  (int) inPointers .size(),
+                                                        outPointers.data(), (int) outPointers.size(),
+                                                        numSamples, context);
+        }
 
     private:
         void restart (double newSr, int newBs) override
@@ -2054,6 +2161,80 @@ private:
         void audioDeviceStopped()                     override { NullCheckedInvocation::invoke (stopped); }
         void audioDeviceError (const String&)         override { NullCheckedInvocation::invoke (error); }
     };
+
+    struct BlockTimes
+    {
+        int numSamples = 0;
+        std::optional<uint64_t> host, input;
+    };
+
+    class TimeRecorder final : public AudioIODeviceCallback
+    {
+    public:
+        std::vector<BlockTimes> blocks;
+
+        void audioDeviceIOCallbackWithContext (const float* const*,
+                                               int,
+                                               float* const*,
+                                               int,
+                                               int numSamples,
+                                               const AudioIODeviceCallbackContext& context) override
+        {
+            BlockTimes block;
+            block.numSamples = numSamples;
+
+            if (context.hostTimeNs != nullptr)
+                block.host = *context.hostTimeNs;
+
+            if (context.inputHostTimeNs != nullptr)
+                block.input = *context.inputHostTimeNs;
+
+            blocks.push_back (block);
+        }
+
+        void audioDeviceAboutToStart (AudioIODevice*) override {}
+        void audioDeviceStopped() override {}
+    };
+
+    // Opens a mock device with the given buffer size, has it make one callback of numSamples
+    // with the given times, and returns what the AudioDeviceManager's client saw of it.
+    std::vector<BlockTimes> deliverOneCallback (double sampleRate,
+                                                int bufferSize,
+                                                int numSamples,
+                                                std::optional<uint64_t> hostTime,
+                                                std::optional<uint64_t> inputHostTime)
+    {
+        AudioDeviceManager manager;
+        manager.addAudioDeviceType (std::make_unique<MockDeviceType> ("foo",
+                                                                      StringArray { "foo in a" },
+                                                                      StringArray { "foo out a" }));
+
+        AudioDeviceManager::AudioDeviceSetup setup;
+        setup.sampleRate = sampleRate;
+        setup.bufferSize = bufferSize;
+        setup.inputDeviceName = "foo in a";
+        setup.outputDeviceName = "foo out a";
+        setup.useDefaultInputChannels = true;
+        setup.useDefaultOutputChannels = true;
+        expect (manager.setAudioDeviceSetup (setup, true).isEmpty());
+
+        TimeRecorder recorder;
+        manager.addAudioCallback (&recorder);
+
+        if (auto* device = dynamic_cast<MockDevice*> (manager.getCurrentAudioDevice()))
+        {
+            const AudioIODeviceCallbackContext context { hostTime ? &*hostTime : nullptr,
+                                                         inputHostTime ? &*inputHostTime : nullptr };
+            device->deliver (numSamples, context);
+        }
+        else
+        {
+            expect (false);
+        }
+
+        manager.removeAudioCallback (&recorder);
+        return recorder.blocks;
+    }
 
     void initialiseManager (AudioDeviceManager& manager)
     {

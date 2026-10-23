@@ -1125,19 +1125,25 @@ private:
             std::copy (src, src + (ptrdiff_t) numSamplesInChunk, inStream->tempBuffers[(size_t) index]);
         }
 
-        // only pass a timestamp for the first chunk of each buffer
-        const auto* timeStamp = std::invoke ([&]() -> const AudioTimeStamp*
+        // The timestamps belong to the first sample of the whole buffer, so each chunk's times are advanced by its offset
+        const auto timeOfChunk = [&] (const AudioTimeStamp* timeStamp)
         {
-            if (sampleOffset != 0)
-                return nullptr;
+            return CallbackTimeHelpers::timeOfSample (timeStamp,
+                                                      kAudioTimeStampHostTimeValid,
+                                                      [this] (uint64_t hostTime) { return timeConversions.hostTimeToNanos (hostTime); },
+                                                      sampleOffset,
+                                                      sampleRate);
+        };
 
-            return numOutputChans > 0 ? outputTimestamp : inputTimestamp;
-        });
+        // Input is only timed if it is captured into this callback
+        const auto inputNanos  = numInputChans  > 0 ? timeOfChunk (inputTimestamp)  : std::nullopt;
+        const auto outputNanos = numOutputChans > 0 ? timeOfChunk (outputTimestamp) : std::nullopt;
+        const auto& hostNanos  = numOutputChans > 0 ? outputNanos : inputNanos;
 
-        const auto nanos = timeStamp != nullptr ? timeConversions.hostTimeToNanos (timeStamp->mHostTime) : 0;
         const AudioIODeviceCallbackContext context
         {
-            timeStamp != nullptr ? &nanos : nullptr,
+            hostNanos.has_value()  ? &*hostNanos  : nullptr,
+            inputNanos.has_value() ? &*inputNanos : nullptr,
         };
 
         callback->audioDeviceIOCallbackWithContext (getTempBuffers (inStream),
@@ -1912,7 +1918,7 @@ private:
                                                             scratchBuffer.getArrayOfWritePointers(),
                                                             numActiveOutputChannels,
                                                             n,
-                                                            context);
+                                                            CallbackTimeHelpers::combinedCallbackContext (context, numActiveOutputChannels > 0));
             }
             else
             {

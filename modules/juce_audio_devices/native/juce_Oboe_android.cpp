@@ -549,6 +549,10 @@ private:
 
             // Note: letting OS to choose the buffer capacity & frames per callback.
             builder.setDirection (direction);
+           #if defined (JUCE_ANDROID_OBOE_INPUT_PRESET)
+            if (direction == oboe::Direction::Input)
+                builder.setInputPreset (static_cast<oboe::InputPreset> (JUCE_ANDROID_OBOE_INPUT_PRESET));
+           #endif
             builder.setSharingMode (sharingMode);
             builder.setChannelCount (channelCount);
             builder.setFormat (format);

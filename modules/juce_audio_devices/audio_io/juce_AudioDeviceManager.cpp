@@ -210,6 +210,12 @@ AudioDeviceManager::~AudioDeviceManager()
     defaultMidiOutput.reset();
 }
 
+void AudioDeviceManager::setAudioDeviceListChangeHandler (AudioDeviceListChangeHandler handler)
+{
+    const ScopedLock lock (deviceListChangeHandlerLock);
+    deviceListChangeHandler = std::move (handler);
+}
+
 //==============================================================================
 void AudioDeviceManager::createDeviceTypesIfNeeded()
 {
@@ -269,6 +275,49 @@ void AudioDeviceManager::updateCurrentSetup()
 
 void AudioDeviceManager::audioDeviceListChanged()
 {
+    bool ownerHandledListChange = false;
+
+    {
+        const ScopedLock lock (deviceListChangeHandlerLock);
+
+        if (deviceListChangeHandler)
+        {
+            auto currentDeviceStillAvailable = [&]
+            {
+                if (currentAudioDevice == nullptr)
+                    return false;
+
+                auto currentTypeName = currentAudioDevice->getTypeName();
+                auto currentDeviceName = currentAudioDevice->getName();
+
+                for (auto* deviceType : availableDeviceTypes)
+                {
+                    if (currentTypeName == deviceType->getTypeName())
+                    {
+                        for (auto& deviceName : deviceType->getDeviceNames (true))
+                            if (currentDeviceName == deviceName)
+                                return true;
+
+                        for (auto& deviceName : deviceType->getDeviceNames (false))
+                            if (currentDeviceName == deviceName)
+                                return true;
+                    }
+                }
+
+                return false;
+            }();
+
+            deviceListChangeHandler (currentDeviceStillAvailable);
+            ownerHandledListChange = true;
+        }
+    }
+
+    if (ownerHandledListChange)
+    {
+        sendChangeMessage();
+        return;
+    }
+
     if (currentAudioDevice != nullptr)
     {
         auto currentDeviceStillAvailable = [&]

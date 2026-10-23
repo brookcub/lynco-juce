@@ -129,7 +129,8 @@ enum
 enum
 {
     AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY = 1,
-    AUDCLNT_BUFFERFLAGS_SILENT = 2
+    AUDCLNT_BUFFERFLAGS_SILENT = 2,
+    AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR = 4
 };
 
 JUCE_IUNKNOWNCLASS (IPropertyStore, "886d8eeb-8cf2-4446-8d02-cdba1dbdcf99")
@@ -263,6 +264,13 @@ JUCE_IUNKNOWNCLASS (IAudioCaptureClient, "C8ADBD64-E71E-48a0-A4DE-185C395CD317")
     JUCE_COMCALL GetNextPacketSize (UINT32*) = 0;
 };
 
+JUCE_IUNKNOWNCLASS (IAudioClock, "CD63314F-3FBA-4a1b-812C-EF96358728E7")
+{
+    JUCE_COMCALL GetFrequency (UINT64*) = 0;
+    JUCE_COMCALL GetPosition (UINT64*, UINT64*) = 0;
+    JUCE_COMCALL GetCharacteristics (DWORD*) = 0;
+};
+
 JUCE_IUNKNOWNCLASS (IAudioRenderClient, "F294ACFC-3146-4483-A7BF-ADDCA7C260E2")
 {
     JUCE_COMCALL GetBuffer (UINT32, BYTE**) = 0;
@@ -345,6 +353,7 @@ __CRT_UUID_DECL (juce::IAudioClient,          0x1CB9AD4C, 0xDBFA, 0x4c32, 0xB1, 
 __CRT_UUID_DECL (juce::IAudioClient2,         0x726778CD, 0xF60A, 0x4eda, 0x82, 0xDE, 0xE4, 0x76, 0x10, 0xCD, 0x78, 0xAA)
 __CRT_UUID_DECL (juce::IAudioClient3,         0x1CB9AD4C, 0xDBFA, 0x4c32, 0xB1, 0x78, 0xC2, 0xF5, 0x68, 0xA7, 0x03, 0xB2)
 __CRT_UUID_DECL (juce::IAudioCaptureClient,   0xC8ADBD64, 0xE71E, 0x48a0, 0xA4, 0xDE, 0x18, 0x5C, 0x39, 0x5C, 0xD3, 0x17)
+__CRT_UUID_DECL (juce::IAudioClock,           0xCD63314F, 0x3FBA, 0x4a1b, 0x81, 0x2C, 0xEF, 0x96, 0x35, 0x87, 0x28, 0xE7)
 __CRT_UUID_DECL (juce::IAudioRenderClient,    0xF294ACFC, 0x3146, 0x4483, 0xA7, 0xBF, 0xAD, 0xDC, 0xA7, 0xC2, 0x60, 0xE2)
 __CRT_UUID_DECL (juce::IAudioEndpointVolume,  0x5CDF2C82, 0x841E, 0x4546, 0x97, 0x22, 0x0C, 0xF7, 0x40, 0x78, 0x22, 0x9A)
 __CRT_UUID_DECL (juce::IAudioSessionEvents,   0x24918ACC, 0x64B3, 0x37C1, 0x8C, 0xA9, 0x74, 0xA6, 0x6E, 0x99, 0x57, 0xA8)
@@ -929,6 +938,89 @@ private:
 };
 
 //==============================================================================
+/*  Works out when the first sample of each callback's input was captured.
+
+    WASAPI stamps every capture packet with the time its first frame was
+    captured, but packets don't go to the callback. They are queued in a
+    reservoir, and the callback takes whatever number of frames it needs from
+    the oldest end. The time of the callback's first sample is therefore that of
+    the oldest queued frame, which is found by counting back from the end of the
+    newest packet.
+
+    That count only holds while every queued frame belongs to one run of
+    packets that have valid times and no gap between them. A packet flagged as a
+    data discontinuity has a gap in front of it, and a packet flagged as a
+    timestamp error has no time at all, so the frames queued before either one
+    have no time until they have been taken.
+*/
+struct InputTimeline
+{
+    void reset (double newSampleRate) noexcept
+    {
+        sampleRate = newSampleRate;
+        endTimeNs = 0;
+        numTimedFrames = 0;
+    }
+
+    /** Call for each packet, in order, once its frames are in the queue. The flags
+        are those GetBuffer returned, and the time is its QPC value, in units of 100 ns.
+    */
+    void addPacket (int numFrames, DWORD flags, UINT64 timeOfFirstFrame) noexcept
+    {
+        if ((flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) != 0)
+        {
+            numTimedFrames = 0;
+            return;
+        }
+
+        if ((flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0)
+            numTimedFrames = 0;
+
+        numTimedFrames += numFrames;
+        endTimeNs = (uint64_t) timeOfFirstFrame * 100 + framesToNs (numFrames);
+    }
+
+    /** Call before taking frames from the queue, with the number of frames queued and
+        the number the callback needs. Returns the time of the callback's first sample in ns,
+        or nothing if that sample is padding, or if any queued frame has no time or follows a gap.
+    */
+    std::optional<uint64_t> takeFrames (int numQueued, int numWanted) noexcept
+    {
+        const auto isTimed = numWanted > 0 && numWanted <= numQueued && numTimedFrames >= numQueued;
+        numTimedFrames = jmin (numTimedFrames, numQueued - jmin (numQueued, numWanted));
+
+        if (isTimed)
+            return endTimeNs - framesToNs (numQueued);
+
+        return {};
+    }
+
+private:
+    uint64_t framesToNs (int numFrames) const noexcept
+    {
+        return (uint64_t) std::llround ((double) numFrames * 1.0e9 / sampleRate);
+    }
+
+    double sampleRate = 1.0;
+    uint64_t endTimeNs = 0;
+    int numTimedFrames = 0; // how many of the newest queued frames are timed, with no gap between them
+};
+
+/*  The time in ns at which frame number frameIndex of an output stream will be presented,
+    from IAudioClock's last answer: the stream position, in units of 1 / clockFrequency
+    seconds, that was being presented at clockQpc (units of 100 ns). The position is not
+    necessarily counted in frames, which is why it is converted with the frequency.
+*/
+static uint64_t getOutputFrameTimeNs (UINT64 clockPosition, UINT64 clockFrequency, UINT64 clockQpc,
+                                      int64 frameIndex, double sampleRate) noexcept
+{
+    const auto positionInFrames = (double) clockPosition * sampleRate / (double) clockFrequency;
+    const auto framesAhead = (double) frameIndex - positionInFrames;
+
+    return (uint64_t) ((int64) clockQpc * 100 + (int64) std::llround (framesAhead * 1.0e9 / sampleRate));
+}
+
+//==============================================================================
 class WASAPIInputDevice final : public WASAPIDeviceBase
 {
 public:
@@ -975,6 +1067,7 @@ public:
 
         queue = SingleThreadedAbstractFifo (reservoirSize);
         reservoir.setSize ((size_t) (queue.getSize() * bytesPerFrame), true);
+        timeline.reset (sampleRate);
         xruns = 0;
 
         if (! check (client->Start()))
@@ -1006,8 +1099,9 @@ public:
         uint8* inputData = nullptr;
         UINT32 numSamplesAvailable = 0;
         DWORD flags = 0;
+        UINT64 qpcPosition = 0;
 
-        while (check (captureClient->GetBuffer (&inputData, &numSamplesAvailable, &flags, nullptr, nullptr)) && numSamplesAvailable > 0)
+        while (check (captureClient->GetBuffer (&inputData, &numSamplesAvailable, &flags, nullptr, &qpcPosition)) && numSamplesAvailable > 0)
         {
             if ((flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0)
                 xruns++;
@@ -1034,15 +1128,18 @@ public:
                 offset += block.getLength();
             }
 
+            timeline.addPacket ((int) numSamplesAvailable, flags, qpcPosition);
             captureClient->ReleaseBuffer (numSamplesAvailable);
         }
     }
 
-    void copyBuffersFromReservoir (float* const* destBuffers, const int numDestBuffers, const int bufferSize)
+    /** Returns the time in ns of the first sample copied, or nothing if it isn't known. */
+    std::optional<uint64_t> copyBuffersFromReservoir (float* const* destBuffers, const int numDestBuffers, const int bufferSize)
     {
         if ((numChannels <= 0 && bufferSize == 0) || reservoir.isEmpty())
-            return;
+            return {};
 
+        const auto time = timeline.takeFrames (queue.getNumReadable(), bufferSize);
         auto offset = jmax (0, bufferSize - queue.getNumReadable());
 
         if (offset > 0)
@@ -1060,11 +1157,14 @@ public:
 
             offset += block.getLength();
         }
+
+        return time;
     }
 
     ComSmartPtr<IAudioCaptureClient> captureClient;
     MemoryBlock reservoir;
     SingleThreadedAbstractFifo queue;
+    InputTimeline timeline;
     int xruns = 0;
 
     std::unique_ptr<AudioData::Converter> converter;
@@ -1086,15 +1186,52 @@ public:
 
     bool open (double newSampleRate, const BigInteger& newChannels, int bufferSizeSamples)
     {
-        return openClient (newSampleRate, newChannels, bufferSizeSamples)
+        numFramesReleased = 0;
+
+        if (! (openClient (newSampleRate, newChannels, bufferSizeSamples)
                 && (numChannels == 0 || check (client->GetService (__uuidof (IAudioRenderClient),
-                                                                   (void**) renderClient.resetAndGetPointerAddress())));
+                                                                   (void**) renderClient.resetAndGetPointerAddress())))))
+            return false;
+
+        // Without the clock the device still plays, but callbacks get no output time
+        if (numChannels > 0
+             && check (client->GetService (__uuidof (IAudioClock), (void**) audioClock.resetAndGetPointerAddress()))
+             && (! check (audioClock->GetFrequency (&clockFrequency)) || clockFrequency == 0))
+            audioClock = nullptr;
+
+        return true;
     }
 
     void close()
     {
         closeClient();
         renderClient = nullptr;
+        audioClock = nullptr;
+    }
+
+    /*  Every frame this device releases to the render client, from the silence in start() on,
+        is part of one stream, and copyBuffers releases the frames of a callback in order, one
+        native write after another, however many it takes. So the first frame of the next
+        callback is the frame at index numFramesReleased in that stream, whether the callback's
+        frames then go out in one write or several, whether the wait for space is in shared
+        mode (the engine's padding) or exclusive mode (the event), and in low-latency mode,
+        which is a shared stream. IAudioClock says which frame is being presented now, so the
+        time of that frame is a prediction that holds as long as the stream doesn't run dry.
+    */
+    std::optional<uint64_t> getTimeOfNextFrame() const
+    {
+        UINT64 position = 0, qpc = 0;
+
+        if (audioClock == nullptr)
+            return {};
+
+        // S_FALSE means the position is valid but the time it was read at is not accurate
+        const auto result = audioClock->GetPosition (&position, &qpc);
+
+        if (! check (result) || result == S_FALSE)
+            return {};
+
+        return getOutputFrameTimeNs (position, clockFrequency, qpc, numFramesReleased, sampleRate);
     }
 
     template <class DestType>
@@ -1118,7 +1255,10 @@ public:
         uint8* outputData;
 
         if (check (renderClient->GetBuffer ((UINT32) samplesToDo, &outputData)))
+        {
             renderClient->ReleaseBuffer ((UINT32) samplesToDo, AUDCLNT_BUFFERFLAGS_SILENT);
+            numFramesReleased += samplesToDo;
+        }
 
         if (! check (client->Start()))
             return false;
@@ -1183,6 +1323,7 @@ public:
                     converter->convertSamples (outputData, channelMaps.getUnchecked (i), srcBuffers[i] + offset, 0, samplesToDo);
 
                 renderClient->ReleaseBuffer ((UINT32) samplesToDo, 0);
+                numFramesReleased += samplesToDo;
             }
 
             bufferSize -= samplesToDo;
@@ -1191,6 +1332,9 @@ public:
     }
 
     ComSmartPtr<IAudioRenderClient> renderClient;
+    ComSmartPtr<IAudioClock> audioClock;
+    UINT64 clockFrequency = 0;
+    int64 numFramesReleased = 0;
     std::unique_ptr<AudioData::Converter> converter;
 
 private:
@@ -1556,6 +1700,8 @@ public:
             if (! inputDeviceActive && ! outputDeviceActive)
                 continue;
 
+            std::optional<uint64_t> inputTime;
+
             if (inputDeviceActive)
             {
                 if (outputDevice == nullptr)
@@ -1574,7 +1720,7 @@ public:
                         inputDevice->handleDeviceBuffer();
                 }
 
-                inputDevice->copyBuffersFromReservoir (ins.getArrayOfWritePointers(), numInputBuffers, bufferSize);
+                inputTime = inputDevice->copyBuffersFromReservoir (ins.getArrayOfWritePointers(), numInputBuffers, bufferSize);
             }
 
             {
@@ -1582,12 +1728,17 @@ public:
 
                 if (sl.isLocked() && (loadedFlags & flagStarted) != 0)
                 {
+                    const std::optional<uint64_t> outputTime = outputDeviceActive ? outputDevice->getTimeOfNextFrame()
+                                                                                  : std::nullopt;
+                    const auto hostTime = numOutputBuffers > 0 ? outputTime : inputTime;
+                    const auto pointerTo = [] (const std::optional<uint64_t>& time) { return time.has_value() ? &*time : nullptr; };
+
                     callback->audioDeviceIOCallbackWithContext (ins.getArrayOfReadPointers(),
                                                                 numInputBuffers,
                                                                 outs.getArrayOfWritePointers(),
                                                                 numOutputBuffers,
                                                                 bufferSize,
-                                                                {});
+                                                                { pointerTo (hostTime), pointerTo (inputTime) });
                 }
                 else
                 {
@@ -2079,6 +2230,198 @@ struct MMDeviceMasterVolume
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MMDeviceMasterVolume)
 };
+
+//==============================================================================
+#if JUCE_UNIT_TESTS
+
+class WasapiTimestampTests final : public UnitTest
+{
+public:
+    WasapiTimestampTests() : UnitTest ("WASAPI timestamps", UnitTestCategories::audio) {}
+
+    void runTest() override
+    {
+        // At 48 kHz, 48 frames last 1 ms and 480 frames last 10 ms. Packet times are in the 100 ns
+        // units GetBuffer reports, so 10 ms is 100,000 of them. Every time expected below was worked
+        // out by hand, as the packet times plus the packet lengths.
+
+        beginTest ("Input: a packet read fully has the time of its first frame");
+        {
+            auto timeline = makeTimeline (48000.0);
+            timeline.addPacket (480, ok, 1'000'000);
+            expectTime (timeline.takeFrames (480, 480), 100'000'000);
+        }
+
+        beginTest ("Input: frames left over are timed from the same packet");
+        {
+            auto timeline = makeTimeline (48000.0);
+            timeline.addPacket (960, ok, 1'000'000);
+            expectTime (timeline.takeFrames (960, 480), 100'000'000);
+            expectTime (timeline.takeFrames (480, 480), 110'000'000);
+        }
+
+        beginTest ("Input: a callback made of two packets has the time of the older one");
+        {
+            // The packets are 6.25 ms long, the newer starting at 106.25 ms
+            auto timeline = makeTimeline (48000.0);
+            timeline.addPacket (300, ok, 1'000'000);
+            timeline.addPacket (300, ok, 1'062'500);
+            expectTime (timeline.takeFrames (600, 480), 100'000'000);
+
+            // 120 frames are left, and a third packet of 360 frames follows them
+            timeline.addPacket (360, ok, 1'125'000);
+            expectTime (timeline.takeFrames (480, 480), 110'000'000);
+        }
+
+        beginTest ("Input: a callback made of three packets has the time of the oldest one");
+        {
+            auto timeline = makeTimeline (48000.0);
+            timeline.addPacket (48, ok, 1'000'000);
+            timeline.addPacket (48, ok, 1'010'000);
+            timeline.addPacket (48, ok, 1'020'000);
+            expectTime (timeline.takeFrames (144, 144), 100'000'000);
+        }
+
+        beginTest ("Input: times stay right while the queue wraps around");
+        {
+            // 441 frames last exactly 10 ms at 44.1 kHz; each packet is taken as three callbacks of
+            // 147 frames, which start 0, 3,333,333 and 6,666,667 ns after the packet
+            auto timeline = makeTimeline (44100.0);
+            SingleThreadedAbstractFifo queue (1024);
+            const uint64_t offsetsNs[] { 0, 3'333'333, 6'666'667 };
+            int numWrong = 0;
+            String firstWrong;
+
+            for (int packet = 0; packet < 200; ++packet)
+            {
+                queue.write (441);
+                timeline.addPacket (441, ok, 2'000'000 + 100'000 * (uint64_t) packet);
+
+                for (auto offsetNs : offsetsNs)
+                {
+                    const auto time = timeline.takeFrames (queue.getNumReadable(), 147);
+                    queue.read (147);
+
+                    if (time != 200'000'000 + 10'000'000 * (uint64_t) packet + offsetNs && numWrong++ == 0)
+                        firstWrong = "packet " + String (packet) + " got " + describe (time);
+                }
+            }
+
+            expectEquals (numWrong, 0, firstWrong);
+        }
+
+        beginTest ("Input: a callback that starts with padding has no time, and the next one does");
+        {
+            auto timeline = makeTimeline (48000.0);
+            expectTime (timeline.takeFrames (0, 480), {});
+
+            timeline.addPacket (300, ok, 1'000'000);
+            expectTime (timeline.takeFrames (300, 480), {});
+
+            timeline.addPacket (480, ok, 1'200'000);
+            expectTime (timeline.takeFrames (480, 480), 120'000'000);
+        }
+
+        beginTest ("Input: after a discontinuity, frames queued before it have no time until they are taken");
+        {
+            // A is 480 frames starting at 100 ms. B follows a gap, starting at 130 ms.
+            auto timeline = makeTimeline (48000.0);
+            timeline.addPacket (480, ok, 1'000'000);
+            timeline.addPacket (480, discontinuity, 1'300'000);
+
+            expectTime (timeline.takeFrames (960, 240), {});    // 240 frames of A left
+            expectTime (timeline.takeFrames (720, 480), {});    // the rest of A and 240 frames of B
+            expectTime (timeline.takeFrames (240, 240), 135'000'000);  // B, from its 240th frame
+
+            timeline.addPacket (480, ok, 1'400'000);
+            expectTime (timeline.takeFrames (480, 480), 140'000'000);
+        }
+
+        beginTest ("Input: a discontinuity does not hide a packet that is alone in the queue");
+        {
+            auto timeline = makeTimeline (48000.0);
+            timeline.addPacket (480, discontinuity, 1'300'000);
+            expectTime (timeline.takeFrames (480, 480), 130'000'000);
+        }
+
+        beginTest ("Input: frames from a timestamp error have no time, and nor do the ones queued before them");
+        {
+            auto timeline = makeTimeline (48000.0);
+            timeline.addPacket (480, ok, 1'000'000);
+            timeline.addPacket (480, timestampError, 0);
+            timeline.addPacket (480, ok, 1'200'000);
+
+            expectTime (timeline.takeFrames (1440, 480), {});   // A
+            expectTime (timeline.takeFrames (960, 480), {});    // the packet with the error
+            expectTime (timeline.takeFrames (480, 480), 120'000'000);
+        }
+
+        beginTest ("Input: a timestamp error in the newest packet leaves nothing timed until it is taken");
+        {
+            auto timeline = makeTimeline (48000.0);
+            timeline.addPacket (480, ok, 1'000'000);
+            timeline.addPacket (480, timestampError, 0);
+
+            expectTime (timeline.takeFrames (960, 480), {});
+            expectTime (timeline.takeFrames (480, 480), {});
+
+            timeline.addPacket (480, ok, 1'400'000);
+            expectTime (timeline.takeFrames (480, 480), 140'000'000);
+        }
+
+        beginTest ("Output: the stream position is converted with the clock's frequency, not the sample rate");
+        {
+            // The stream is at 1 s and the device clock read that at 200 ms on the QPC timeline,
+            // so the frame 480 frames (10 ms) after that is presented at 210 ms.
+            expectEquals (getOutputFrameTimeNs (48000,     48000,     2'000'000, 48480, 48000.0), (uint64_t) 210'000'000);
+            expectEquals (getOutputFrameTimeNs (10'000'000, 10'000'000, 2'000'000, 48480, 48000.0), (uint64_t) 210'000'000);
+            expectEquals (getOutputFrameTimeNs (384'000,   384'000,   2'000'000, 48480, 48000.0), (uint64_t) 210'000'000);   // bytes: 8 per frame
+
+            // The stream is at 0.5 s at 300 ms on the QPC timeline: frame 24960 is 20 ms on
+            expectEquals (getOutputFrameTimeNs (5'000'000, 10'000'000, 3'000'000, 24960, 48000.0), (uint64_t) 320'000'000);
+        }
+
+        beginTest ("Output: frames released ahead of the position are later in time");
+        {
+            // Three buffers of 480 frames are queued ahead of the position: 30 ms
+            expectEquals (getOutputFrameTimeNs (10'000'000, 10'000'000, 2'000'000, 48000 + 1440, 48000.0), (uint64_t) 230'000'000);
+        }
+
+        beginTest ("Output: a stream that ran dry gives a time before the clock's");
+        {
+            expectEquals (getOutputFrameTimeNs (10'000'000, 10'000'000, 2'000'000, 48000 - 480, 48000.0), (uint64_t) 190'000'000);
+        }
+
+        beginTest ("Output: a fraction of a nanosecond is rounded to the nearest");
+        {
+            // One frame lasts 20,833.33 ns
+            expectEquals (getOutputFrameTimeNs (0, 10'000'000, 1'000'000, 1, 48000.0), (uint64_t) 100'020'833);
+        }
+    }
+
+private:
+    static constexpr DWORD ok = 0,
+                           discontinuity = AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY,
+                           timestampError = AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR;
+
+    static InputTimeline makeTimeline (double sampleRate)
+    {
+        InputTimeline timeline;
+        timeline.reset (sampleRate);
+        return timeline;
+    }
+
+    static String describe (std::optional<uint64_t> time)   { return time.has_value() ? String (*time) : String ("no time"); }
+
+    void expectTime (std::optional<uint64_t> actual, std::optional<uint64_t> expected)
+    {
+        expect (actual == expected, "got " + describe (actual) + ", expected " + describe (expected));
+    }
+};
+
+static WasapiTimestampTests wasapiTimestampTests;
+
+#endif
 
 } // namespace WasapiClasses
 

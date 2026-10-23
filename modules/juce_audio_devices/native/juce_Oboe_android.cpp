@@ -596,7 +596,7 @@ private:
                 JUCE_OBOE_LOG ("Failed to get Xrun count: " + getOboeString (count.error()));
             }
 
-            return 0;
+            return -1;
         }
 
     private:
@@ -715,10 +715,13 @@ private:
 
         int getXRunCount() const
         {
-            int inputXRunCount  = jmax (0, inputStream  != nullptr ? inputStream->getXRunCount() : 0);
-            int outputXRunCount = jmax (0, outputStream != nullptr ? outputStream->getXRunCount() : 0);
+            const auto inputXRunCount  = inputStream  != nullptr ? inputStream->getXRunCount()  : -1;
+            const auto outputXRunCount = outputStream != nullptr ? outputStream->getXRunCount() : -1;
 
-            return inputXRunCount + outputXRunCount;
+            if (inputXRunCount < 0 && outputXRunCount < 0)
+                return -1;
+
+            return jmax (0, inputXRunCount) + jmax (0, outputXRunCount);
         }
 
     protected:

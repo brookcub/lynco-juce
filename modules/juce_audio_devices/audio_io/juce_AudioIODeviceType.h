@@ -177,6 +177,35 @@ public:
     /** Creates an Oboe device type if it's available on this platform, or returns null. */
     static AudioIODeviceType* createAudioIODeviceType_Oboe();
 
+   #if JUCE_ANDROID || DOXYGEN
+    /** Callbacks that the device type from createAudioIODeviceType_Android() makes on each
+        android.media.AudioRecord it opens for input, for example to call setPreferredDevice()
+        or to watch where the input is routed.
+
+        Each callback receives the calling thread's JNIEnv* and the AudioRecord jobject, and
+        must not leave a Java exception pending. Empty callbacks are skipped. If an AudioRecord
+        fails to initialise after beforeStart, it is dropped without further callbacks.
+
+        (Android only)
+    */
+    struct AndroidAudioRecordCallbacks
+    {
+        /** Called after the AudioRecord is created, before recording starts. */
+        std::function<void (void* jniEnv, void* audioRecord)> beforeStart;
+
+        /** Called after AudioRecord.startRecording(). */
+        std::function<void (void* jniEnv, void* audioRecord)> afterStart;
+
+        /** Called before AudioRecord.stop(), for each AudioRecord that afterStart was called for. */
+        std::function<void (void* jniEnv, void* audioRecord)> beforeStop;
+    };
+
+    /** Sets the callbacks for inputs opened from now on. An open input keeps the callbacks it
+        was opened with until it closes, then releases them. Pass {} to remove them. (Android only)
+    */
+    static void setAndroidAudioRecordCallbacks (AndroidAudioRecordCallbacks callbacks);
+   #endif
+
     /** @cond */
     [[deprecated ("You should call the method which takes a WASAPIDeviceMode instead.")]]
     static AudioIODeviceType* createAudioIODeviceType_WASAPI (bool exclusiveMode);

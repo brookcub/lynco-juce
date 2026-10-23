@@ -125,3 +125,21 @@ An app that defines a macro does so at its own build boundary (for example `targ
 - **Test evidence:** `UnitTestRunner` built out of tree with `cmake -S <JUCE> -B <build> -DJUCE_BUILD_EXTRAS=ON`, then `cmake --build <build> --target UnitTestRunner --config Release`, run as `UnitTestRunner --category=Audio`. Tested 2026-10-23, Windows 11, MSVC (Visual Studio 18).
   1. With this patch: exit code 0, `All tests completed successfully`, 205 `Completed tests` lines, no `!!!` lines.
   2. With only the `blockContext` argument in `CallbackMaxSizeEnforcer` changed back to `context` (the tests kept): exit code 1; the two-block times case fails 2 checks, the one-time-null case 2 checks and the rounding case 4 checks. The case with both times null passes on the old code too, because it guards that the fix does not invent a time.
+
+### P007: Callback context carries the input sample time
+
+- **Files:** `modules/juce_audio_devices/audio_io/juce_AudioIODevice.h`
+- **Changes:** adds `AudioIODeviceCallbackContext::inputHostTimeNs` (`const uint64_t*`, default `nullptr`) and documents what both time fields mean. `hostTimeNs` is the time of the first output sample of the callback, or of the first input sample when there is no output, and null when that cannot be established even if there are outputs. `inputHostTimeNs` is the time of the first input sample actually captured into the callback, and null when the device gives none or the first sample was not captured (for example padding). Both are nanoseconds on the timeline of `Time::getHighResolutionTicks()`, are the times the OS or driver reports with no latency or bias correction, and converting a device's position and time pair to the callback's first sample is part of the contract while guessing a latency is not.
+- **Why:** the context had one time with a vague comment, and a device with inputs and outputs has two different first samples: the input was captured before the output will be heard.
+- **Default behaviour:** nothing fills the new field yet, so there is no behaviour change; every existing backend leaves it null. Declaration and documentation only, every platform.
+- **Test evidence:** the aggregate initialisation in `juce_CoreAudio_mac.cpp` names only the first member and is unaffected; every other user of the struct only receives or forwards it. `UnitTestRunner` builds on Windows with the change (Release, MSVC), and `UnitTestRunner --category=Audio` passes.
+
+### P008: Split callbacks get advanced times
+
+- **Files:** `modules/juce_audio_devices/audio_io/juce_AudioDeviceManager.cpp`
+- **Changes:** `CallbackMaxSizeEnforcer`, which splits a device callback longer than the device's buffer size into blocks, keeps the device's sample rate from `audioDeviceAboutToStart` and, for every block after the first, passes a context whose non-null `hostTimeNs` and `inputHostTimeNs` are the original value plus `position * 1e9 / sampleRate` rounded to the nearest nanosecond. A null time stays null; the first block gets the original pointers. The values live in locals of the callback, so nothing is allocated. The `AudioDeviceManager` unit tests gain four cases and the mock device offers a buffer size of 512 and can make a callback.
+- **Why:** the same context was passed to every block, so the second and later blocks carried the time of the first block's first sample.
+- **Default behaviour:** unchanged whenever a callback is not split (one block, the original pointers). Every platform that delivers `hostTimeNs`, or `inputHostTimeNs` from P007.
+- **Test evidence:** `UnitTestRunner` built out of tree with `cmake -S <JUCE> -B <build> -DJUCE_BUILD_EXTRAS=ON`, then `cmake --build <build> --target UnitTestRunner --config Release`, run as `UnitTestRunner --category=Audio`. Tested 2026-10-23, Windows 11, MSVC (Visual Studio 18).
+  1. With this patch: exit code 0, `All tests completed successfully`, 205 `Completed tests` lines, no `!!!` lines.
+  2. With only the `blockContext` argument in `CallbackMaxSizeEnforcer` changed back to `context` (the tests kept): exit code 1; the two-block times case fails 2 checks, the one-time-null case 2 checks and the rounding case 4 checks. The case with both times null passes on the old code too, because it guards that the fix does not invent a time.

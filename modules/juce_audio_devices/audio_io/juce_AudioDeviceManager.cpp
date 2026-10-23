@@ -145,6 +145,11 @@ public:
         inner.audioDeviceStopped();
     }
 
+    void audioDeviceError (const String& message) override
+    {
+        inner.audioDeviceError (message);
+    }
+
 private:
     static const uint64_t* advance (const uint64_t* time, uint64_t offsetNs, uint64_t& storage)
     {
@@ -1747,6 +1752,38 @@ public:
             expectEquals (numCalls, 1);
         }
 
+        beginTest ("An error reported by the device reaches the callbacks added to the manager");
+        {
+            AudioDeviceManager manager;
+            manager.addAudioDeviceType (std::make_unique<MockDeviceType> ("foo",
+                                                                          StringArray { "foo in a" },
+                                                                          StringArray { "foo out a" }));
+
+            AudioDeviceManager::AudioDeviceSetup setup;
+            setup.sampleRate = 48000.0;
+            setup.bufferSize = 256;
+            setup.inputDeviceName = "foo in a";
+            setup.outputDeviceName = "foo out a";
+            setup.useDefaultInputChannels = true;
+            setup.useDefaultOutputChannels = true;
+            expect (manager.setAudioDeviceSetup (setup, true).isEmpty());
+
+            StringArray received;
+            MockCallback callback;
+            callback.error = [&] (const String& message) { received.add (message); };
+            manager.addAudioCallback (&callback);
+
+            if (auto* device = dynamic_cast<MockDevice*> (manager.getCurrentAudioDevice()))
+                device->reportError ("Audio stream error: ErrorInternal");
+            else
+                expect (false);
+
+            expectEquals (received.size(), 1);
+            expectEquals (received.joinIntoString ("|"), String ("Audio stream error: ErrorInternal"));
+
+            manager.removeAudioCallback (&callback);
+        }
+
         beginTest ("A callback longer than the buffer size is split, and each block gets the time of its own first sample");
         {
             // 512 samples at 48 kHz last 10,666,666.67 ns
@@ -2050,6 +2087,12 @@ private:
         int getOutputLatencyInSamples() override { return 0; }
         int getInputLatencyInSamples() override { return 0; }
 
+        // Emulates the device reporting an error to the callback it was started with.
+        void reportError (const String& message)
+        {
+            callback->audioDeviceError (message);
+        }
+
         // Emulates the device calling back with one block of silence.
         void deliver (int numSamples, const AudioIODeviceCallbackContext& context)
         {
@@ -2145,7 +2188,7 @@ private:
         std::function<void()> callback;
         std::function<void()> aboutToStart;
         std::function<void()> stopped;
-        std::function<void()> error;
+        std::function<void (const String&)> error;
 
         void audioDeviceIOCallbackWithContext (const float* const*,
                                                int,
@@ -2159,7 +2202,7 @@ private:
 
         void audioDeviceAboutToStart (AudioIODevice*) override { NullCheckedInvocation::invoke (aboutToStart); }
         void audioDeviceStopped()                     override { NullCheckedInvocation::invoke (stopped); }
-        void audioDeviceError (const String&)         override { NullCheckedInvocation::invoke (error); }
+        void audioDeviceError (const String& message) override { NullCheckedInvocation::invoke (error, message); }
     };
 
     struct BlockTimes

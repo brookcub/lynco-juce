@@ -44,10 +44,29 @@ class AudioIODevice;
 */
 struct AudioIODeviceCallbackContext
 {
-    /** If the host provides this information, this field will be set to point to
-        an integer holding the current value; otherwise, this will be nullptr.
+    /** The time of the first output sample of this callback, or of the first input
+        sample if the callback has no output. Points to a value in nanoseconds, or is
+        nullptr if that time can't be established, even if there are outputs.
+
+        Both this and inputHostTimeNs are on the platform's high-resolution
+        monotonic clock, the timeline of Time::getHighResolutionTicks() (QPC on
+        Windows, CLOCK_MONOTONIC on Android and Linux, mach host time on Apple).
+
+        They are times the OS or driver reports for the audio pipeline, with no
+        latency or bias correction. They are not when the signal reached the DAC or
+        left the ADC: hardware, DSP and acoustic delay the driver doesn't report are
+        outside this contract. Output times are predictions of when the output will
+        be presented. Converting a device's position and time pair to the time of
+        this callback's first sample is part of the contract; guessing a latency is not.
     */
     const uint64_t* hostTimeNs = nullptr;
+
+    /** The time of the first input sample actually captured into this callback,
+        in nanoseconds on the same clock as hostTimeNs. This is nullptr if the device
+        doesn't provide one, or if the first sample was not captured (for example
+        when the start of the block is padding).
+    */
+    const uint64_t* inputHostTimeNs = nullptr;
 };
 
 //==============================================================================

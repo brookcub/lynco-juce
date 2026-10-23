@@ -74,6 +74,13 @@ enum
     STATE_UNINITIALIZED = 0
 };
 
+// LynCo P003: the MediaRecorder.AudioSource used when more than one input channel is opened.
+// 0 is DEFAULT, which is what JUCE has always used; an app that wants raw multi-channel capture
+// defines this as 9 (UNPROCESSED). A one-channel open always uses DEFAULT.
+#ifndef JUCE_ANDROID_AUDIORECORD_MULTICHANNEL_SOURCE
+ #define JUCE_ANDROID_AUDIORECORD_MULTICHANNEL_SOURCE 0
+#endif
+
 const char* const javaAudioTypeName = "Android Audio";
 
 //==============================================================================
@@ -237,7 +244,7 @@ public:
             {
                 numDeviceInputChannels = jmin (numClientInputChannels, numDeviceInputChannelsAvailable);
                 inputDevice = GlobalRef (LocalRef<jobject> (env->NewObject (AudioRecord, AudioRecord.constructor,
-                                                                            0 /* (default audio source) */, sampleRate,
+                                                                            numDeviceInputChannels > 1 ? JUCE_ANDROID_AUDIORECORD_MULTICHANNEL_SOURCE : 0 /* DEFAULT */, sampleRate,
                                                                             numDeviceInputChannels > 1 ? CHANNEL_IN_STEREO : CHANNEL_IN_MONO,
                                                                             ENCODING_PCM_16BIT,
                                                                             (jint) (minBufferSizeIn * numDeviceInputChannels * static_cast<int> (sizeof (int16))))));

@@ -22,6 +22,14 @@ This file describes the JUCE problem each patch addresses and what it changes. I
 3. Rebuild and retest every LynCo app against the branch.
 4. Tag the result `lynco-<juce>.<n>`. Tags are never moved; a fix gets a new tag.
 
+### Moving an app's pin
+
+An app pins the fork as a submodule gitlink at a tagged commit.
+
+1. **Approval:** moving the pin needs Brooklyn's approval in the app's repository. The approval is a commit message line `JUCE-Upgrade: approved <sha>`, where `<sha>` is the full 40-character commit the gitlink points to at the head of the change. A tag name or a short SHA does not count. Only Brooklyn gives it, and it is never self-served.
+2. **Gate:** if the gitlink differs between the change's base and head, some commit in base..head must carry that line with the head gitlink's SHA. A bare `JUCE-Upgrade: approved`, or a line naming another SHA, does not count, so moving the pin again needs a new line. A change that moves the pin and back needs none.
+3. **Fetching a tag** into a submodule whose clone borrows objects through alternates: `git -c fetch.negotiationAlgorithm=noop fetch origin tag <tag>`. The default negotiation can fail on the thin pack.
+
 ## Macros the series adds
 
 An app that defines a macro does so at its own build boundary (for example `target_compile_definitions`), for every translation unit that includes the module.

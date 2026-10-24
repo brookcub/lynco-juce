@@ -1862,6 +1862,10 @@ public:
 
     static void handleAppResumedCallback (JNIEnv*, AndroidComponentPeer& t)
     {
+        // The display can change while the app is stopped (a portrait-only lock screen turns it)
+        // and turn back with no layout or insets callback to tell us.
+        forceDisplayUpdate();
+
         if (t.isKioskModeComponent())
             t.refreshSystemBarsAndSetHidden (t.navBarsHidden);
     }
@@ -2946,7 +2950,13 @@ void Displays::findDisplays (const Desktop& desktop)
 
     if (sdkVersion >= 30)
     {
-        const LocalRef<jobject> windowMetrics (env->CallObjectMethod (windowManager, AndroidWindowManager30.getCurrentWindowMetrics));
+        // The Activity's window, not the application's: the two differ while a portrait-only lock
+        // screen covers a landscape Activity.
+        LocalRef activityWindowManager { activity != nullptr
+                                         ? env->CallObjectMethod (activity, AndroidActivity.getWindowManager)
+                                         : nullptr };
+        const LocalRef<jobject> windowMetrics (env->CallObjectMethod (activityWindowManager != nullptr ? activityWindowManager.get() : windowManager.get(),
+                                                                      AndroidWindowManager30.getCurrentWindowMetrics));
         const LocalRef<jobject> bounds (env->CallObjectMethod (windowMetrics, AndroidWindowMetrics.getBounds));
         d.userArea = (Rectangle<int>::leftTopRightBottom (env->GetIntField (bounds, AndroidRect.left),
                                                           env->GetIntField (bounds, AndroidRect.top),

@@ -334,3 +334,36 @@ An app that defines a macro does so at its own build boundary (for example `targ
   Application recovery and clean smoke checks are recorded by the consuming application's PR.
   Other Android versions/devices and desktop audio were not qualified. This patch does
   not fix the separately reproduced vendor MMAP process-death cleanup crash.
+
+### P017: Notify clients when an Oboe device is explicitly stopped
+
+- **Files:** `modules/juce_audio_devices/native/juce_Oboe_android.cpp`, its adjacent
+  `_test.cpp`, and the instructions in `extras/OboeLifecycleTests`.
+- **Contract:** explicit `stop()`, `close()`, and reopening a running device notify
+  the detached client exactly once, after native audio is quiescent. Stopped/closed
+  state is visible before the notification. Repeated closure sends no duplicate.
+  `start(nullptr)` uses the same stop path, including during an active audio callback.
+  Restart after stop recreates native streams and their error handler through the
+  existing open path before preparing the client. Starting a closed device reports
+  an error without preparing it.
+  The callback pointer stays stable during processing. Replacement uses the existing
+  audio mutex; the audio thread only tries that lock and emits silence on contention.
+- **Lifetime:** reuse P016's retained control and lifecycle revision to allow client
+  stop, close, destruction, or replacement during notification. A superseded outer
+  open returns a cancellation error without overwriting the replacement or its error.
+  Internal teardown remains silent so
+  startup failure and disconnection recovery retain their existing single stopped
+  notifications. Destructor teardown remains silent, as before.
+- **Scope:** a separate callback-contract correction on top of P016. No changes to
+  its startup/error reporting or JUCE's recovery policy; no retry limit or timeout.
+- **Verification:** ARM64 Debug on Pixel 7, Android 16. The explicit-stop tests on
+  unchanged P016 (`5ab7720`) reproduced 41 failed assertions (577 passed), all in
+  the added notification/replacement cases. With this patch and the additional
+  restart, callback-identity and cancelled-open regressions, 759 assertions passed
+  with microphone permission and 562 with permission denied, with zero failures.
+  The held-callback tests check completion of the client invocation, not its release
+  signal. Both phases exited normally;
+  the Pixel audio-service PID stayed unchanged throughout the comparison.
+  The suite covers direct stop/close, repeated closure, callback-visible state,
+  recursive lifecycle calls, destruction, replacement, and existing P016 failure
+  and recovery cases. Other Android devices and versions were not qualified.

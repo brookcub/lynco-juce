@@ -163,7 +163,7 @@ public:
     {
         const ScopedLock lock (control->mutex);
         control->owner = nullptr;
-        close();
+        stopInternal();
     }
 
     StringArray getOutputChannelNames() override    { return getChannelNames (false); }
@@ -209,8 +209,13 @@ public:
     String open (const BigInteger& inputChannels, const BigInteger& outputChannels,
                  double requestedSampleRate, int bufferSize) override
     {
-        const ScopedLock lock (control->mutex);
+        const auto state = control;
+        const ScopedLock lock (state->mutex);
+        // close() advances once; a client lifecycle operation supersedes this open.
+        const auto lifecycle = state->lifecycle + 1;
         close();
+        if (state->owner == nullptr || state->lifecycle != lifecycle)
+            return "Audio device open was cancelled";
 
         lastError.clear();
 
@@ -258,7 +263,13 @@ public:
         return lastError;
     }
 
-    void close() override                               { const ScopedLock lock (control->mutex); stop(); deviceOpen = false; }
+    void close() override
+    {
+        const auto state = control;
+        const ScopedLock lock (state->mutex);
+        deviceOpen = false;
+        stop();
+    }
     // Session/configuration queries require caller serialization with lifecycle operations.
     int getOutputLatencyInSamples() override            { return session != nullptr ? session->getOutputLatencyInSamples() : 0; }
     int getInputLatencyInSamples() override             { return session != nullptr ? session->getInputLatencyInSamples() : 0; }
@@ -283,6 +294,12 @@ public:
 
     void start (AudioIODeviceCallback* newCallback) override
     {
+        if (newCallback == nullptr)
+        {
+            stop();
+            return;
+        }
+
         const auto state = control;
         const ScopedLock lock (state->mutex);
         ++state->lifecycle;
@@ -293,13 +310,10 @@ public:
 
     void stop() override
     {
-        const ScopedLock lock (control->mutex);
-        ++control->lifecycle;
-        if (session != nullptr)
-            session->stop();
-
-        running = false;
-        setCallback (nullptr);
+        const auto state = control;
+        const ScopedLock lock (state->mutex);
+        if (auto* oldCallback = stopInternal())
+            oldCallback->audioDeviceStopped();
     }
 
     bool setAudioPreprocessingEnabled (bool) override
@@ -312,6 +326,16 @@ public:
     static const char* const oboeTypeName;
 
 private:
+    AudioIODeviceCallback* stopInternal()
+    {
+        ++control->lifecycle;
+        if (session != nullptr)
+            session->stop();
+
+        running = false;
+        return callback.exchange (nullptr);
+    }
+
     template <typename SampleType>
     static int prepareInputBuffer (SampleType* nativeBuffer, AudioBuffer<float>& buffer,
                                    int numFrames, oboe::ResultWithValue<int32_t> result)
@@ -330,6 +354,15 @@ private:
 
     String startInternal (AudioIODeviceCallback* newCallback)
     {
+        jassert (newCallback != nullptr);
+        if (! deviceOpen)
+            return lastError = "Audio device is not open";
+
+        // stop() quiesces and destroys native streams but retains the device setup.
+        if (session == nullptr || ! session->openedOk())
+            if (const auto error = open (activeInputChans, activeOutputChans, sampleRate, actualBufferSize); error.isNotEmpty())
+                return error;
+
         if (callback.get() != newCallback)
         {
             const auto state = control;
@@ -346,11 +379,7 @@ private:
             if (oldCallback != nullptr)
             {
                 // already running
-                if (newCallback == nullptr)
-                    stop();
-                else
-                    setCallback (newCallback);
-
+                setCallback (newCallback);
                 oldCallback->audioDeviceStopped();
             }
             else
@@ -363,7 +392,8 @@ private:
 
                 if (const auto result = session->start(); result != oboe::Result::OK)
                 {
-                    close();
+                    deviceOpen = false;
+                    stopInternal();
                     const auto message = "Unable to start audio stream: " + getOboeString (result);
                     lastError = message;
                     const auto lifecycle = state->lifecycle;
@@ -459,35 +489,15 @@ private:
 
     void setCallback (AudioIODeviceCallback* callbackToUse)
     {
-        if (! running)
-        {
-            callback.set (callbackToUse);
-            return;
-        }
-
-        // Setting nullptr callback is allowed only when playback is stopped.
-        jassert (callbackToUse != nullptr);
-
-        for (;;)
-        {
-            auto old = callback.get();
-
-            if (old == callbackToUse)
-                break;
-
-            // If old is nullptr, then it means that it's currently being used!
-            if (old != nullptr && callback.compareAndSetBool (callbackToUse, old))
-                break;
-
-            Thread::sleep (1);
-        }
+        const SpinLock::ScopedLockType lock { audioCallbackMutex };
+        callback.set (callbackToUse);
     }
 
     void process (const float* const* inputChannelData, int numInputChannels,
                   float* const* outputChannelData, int numOutputChannels, int32_t numFrames,
                   std::optional<uint64_t> outputTime, std::optional<uint64_t> inputTime)
     {
-        if (auto* cb = callback.exchange (nullptr))
+        if (auto* cb = callback.get())
         {
             // As the callback context defines them: with no outputs the callback's time is the input's.
             const auto hostTime = numOutputChannels > 0 ? outputTime : inputTime;
@@ -499,7 +509,6 @@ private:
                                                   numOutputChannels,
                                                   numFrames,
                                                   { pointerTo (hostTime), pointerTo (inputTime) });
-            callback.set (cb);
         }
         else
         {
@@ -592,7 +601,7 @@ private:
 
     std::pair<AudioIODeviceCallback*, String> handleStreamError (oboe::Result error)
     {
-        // process() temporarily takes the callback; quiesce before reading it.
+        // Quiesce before notifying or replacing the callback.
         session->stop();
         auto* callbackToRestore = callback.get();
         if (callbackToRestore == nullptr)
@@ -602,7 +611,7 @@ private:
         const auto outputChannels = activeOutputChans;
         const auto rate           = (double) sampleRate;
         const auto bufferSize     = actualBufferSize;
-        stop();
+        stopInternal();
         const auto state = control;
         const auto lifecycle = state->lifecycle;
         callbackToRestore->audioDeviceStopped();
@@ -990,7 +999,7 @@ private:
         {
             errorCallback->detach();
             {
-                const SpinLock::ScopedLockType lock { audioCallbackMutex };
+                const SpinLock::ScopedLockType lock { owner.audioCallbackMutex };
                 destroyStreams();
             }
             inputErrorDispatcher.reset();
@@ -1013,7 +1022,7 @@ private:
 
         oboe::DataCallbackResult onAudioReady (oboe::AudioStream* stream, void* audioData, int32_t numFrames) override
         {
-            const SpinLock::ScopedTryLockType lock { audioCallbackMutex };
+            const SpinLock::ScopedTryLockType lock { owner.audioCallbackMutex };
 
             if (lock.isLocked())
             {
@@ -1097,6 +1106,11 @@ private:
 
                 if (isOutputLatencyDetectionSupported)
                     outputLatency = getLatencyFor (*outputStream, outputTimestamp);
+            }
+
+            else
+            {
+                zeromem (audioData, (size_t) numFrames * (size_t) numOutputChannels * sizeof (SampleType));
             }
 
             return oboe::DataCallbackResult::Continue;
@@ -1206,7 +1220,6 @@ private:
         std::vector<SampleType> inputStreamNativeBuffer;
         AudioBuffer<float> inputStreamSampleBuffer,
                            outputStreamSampleBuffer;
-        SpinLock audioCallbackMutex;
 
         // Oboe advises against calling getTimestamp() from a data callback before Android 11 (R)
         const bool areDeviceTimesSupported = android_get_device_api_level() >= 30;
@@ -1231,6 +1244,7 @@ private:
     String lastError;
     BigInteger activeOutputChans, activeInputChans;
     Atomic<AudioIODeviceCallback*> callback { nullptr };
+    SpinLock audioCallbackMutex;
 
     int inputDeviceId;
     Array<int> supportedInputSampleRates;

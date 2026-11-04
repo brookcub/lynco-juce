@@ -1,6 +1,8 @@
-/* Android regression tests for LynCo patch P016.
+/* Android regression tests for LynCo Oboe patches.
    Run with the supplied runner, with and without RECORD_AUDIO permission; see
    extras/OboeLifecycleTests/README.md. This file is included by the backend. */
+
+#include <thread>
 
 namespace juce
 {
@@ -22,6 +24,9 @@ public:
 
         beginTest ("Hardware prerequisites");
         expect (MessageManager::getInstance()->isThisTheMessageThread());
+        checkCallbackIdentity();
+        checkExplicitStops();
+        checkRestart (false);
         if (! RuntimePermissions::isGranted (RuntimePermissions::recordAudio))
         {
             beginTest ("Denied microphone permission creates no session");
@@ -41,6 +46,8 @@ public:
             device->close();
             return;
         }
+
+        checkRestart (true);
 
         beginTest ("Playback stays true inside an audio callback");
         {
@@ -237,6 +244,250 @@ public:
     }
 
 private:
+    void checkRestart (bool withInput)
+    {
+        for (const auto clearBeforeStart : { false, true })
+        {
+            beginTest (String (withInput ? "Duplex" : "Output-only")
+                       + (clearBeforeStart ? " open, clear callback, start" : " start, stop, start"));
+            Callback client;
+            auto device = makeDevice();
+            const auto error = device->open (BigInteger (withInput ? 1 : 0), BigInteger (3), 48000, 1920);
+            expect (error.isEmpty(), error);
+            if (error.isNotEmpty()) continue;
+            WaitableEvent processed;
+            client.processing = [&] { processed.signal(); };
+            if (clearBeforeStart)
+                device->start (nullptr);
+            else
+            {
+                device->start (&client);
+                expect (processed.wait (3000), "No audio before stop");
+                device->stop();
+            }
+            const auto previousErrorCallback = device->session->errorCallback;
+            expect (device->isOpen());
+            expect (! device->isPlaying());
+            processed.reset();
+            client.preparing = [&] { expect (device->session->openedOk()); };
+            device->start (&client);
+            expect (processed.wait (3000), "No audio after restart");
+            expect (device->isOpen() && device->isPlaying());
+            expect (device->session->errorCallback != previousErrorCallback);
+            expect (! previousErrorCallback->attached);
+            expect (device->session->errorCallback->attached);
+            if (withInput) expect (device->session->inputStream != nullptr);
+            expectEquals (client.starts, clearBeforeStart ? 1 : 2);
+            expectEquals (client.stops, clearBeforeStart ? 0 : 1);
+            expectEquals (client.errors, 0);
+            device->stop();
+            expectEquals (client.stops, client.starts);
+            device->close();
+            expect (! device->isOpen());
+            device->start (&client);
+            expect (! device->isOpen() && ! device->isPlaying());
+            expectEquals (client.errors, 1);
+            expectEquals (client.stops, client.starts);
+        }
+    }
+
+    void checkCallbackIdentity()
+    {
+        for (const auto replace : { false, true })
+        {
+            beginTest (replace ? "Replacing a callback waits for its active invocation"
+                               : "Starting the same callback during processing is a no-op");
+            Callback client, replacement;
+            auto device = makeDevice();
+            const auto error = device->open ({}, BigInteger (3), 48000, 1920);
+            expect (error.isEmpty(), error);
+            if (error.isNotEmpty()) continue;
+            WaitableEvent entered, release, processed;
+            std::atomic<bool> held { false }, callbackExited { false };
+            client.processing = [&]
+            {
+                if (! held.exchange (true))
+                {
+                    entered.signal();
+                    release.wait (3000);
+                }
+                else
+                    processed.signal();
+            };
+            client.finished = [&] { callbackExited = true; };
+            client.stopped = [&] { expect (callbackExited.load()); };
+            replacement.processing = [&] { processed.signal(); };
+            device->start (&client);
+            expect (entered.wait (3000), "No audio callback arrived");
+            std::thread releaser ([&] { Thread::sleep (100); release.signal(); });
+            device->start (replace ? &replacement : &client);
+            releaser.join();
+            expectEquals (client.starts, 1);
+            expectEquals (client.stops, replace ? 1 : 0);
+            expectEquals (client.errors, 0);
+            expectEquals (replacement.starts, replace ? 1 : 0);
+            expectEquals (replacement.errors, 0);
+            expect (processed.wait (3000), "No audio after callback selection");
+            device->stop();
+            expectEquals (client.stops, 1);
+            expectEquals (replacement.stops, replace ? 1 : 0);
+            device->close();
+        }
+
+        beginTest ("Callback replacement contention emits silence");
+        auto device = makeDevice();
+        const auto error = device->open ({}, BigInteger (3), 48000, 1920);
+        expect (error.isEmpty(), error);
+        if (error.isNotEmpty()) return;
+        auto* session = dynamic_cast<OboeAudioIODevice::OboeSessionImpl<float>*> (device->session.get());
+        expect (session != nullptr);
+        if (session != nullptr)
+        {
+            std::array<float, 17> output;
+            output.fill (0.5f);
+            {
+                const SpinLock::ScopedLockType lock { device->audioCallbackMutex };
+                std::thread audio ([&]
+                {
+                    session->onAudioReady (session->outputStream->getNativeStream().get(), output.data(), 8);
+                });
+                audio.join();
+            }
+            expect (std::all_of (output.begin(), output.end() - 1, [] (float sample) { return sample == 0.0f; }));
+            expectEquals (output.back(), 0.5f);
+        }
+        device->close();
+    }
+
+    void checkExplicitStops()
+    {
+        beginTest ("Clearing a callback waits until the audio thread returns it");
+        {
+            Callback client;
+            auto device = makeDevice();
+            const auto error = device->open ({}, BigInteger (3), 48000, 1920);
+            expect (error.isEmpty(), error);
+            if (error.isEmpty())
+            {
+                WaitableEvent entered, release;
+                std::atomic<bool> held { false }, callbackExited { false };
+                client.processing = [&]
+                {
+                    if (! held.exchange (true))
+                    {
+                        entered.signal();
+                        release.wait (3000);
+                    }
+                };
+                client.finished = [&] { callbackExited = true; };
+                device->start (&client);
+                expect (entered.wait (3000), "No audio callback arrived");
+                std::thread releaser ([&]
+                {
+                    Thread::sleep (100);
+                    release.signal();
+                });
+                device->start (nullptr);
+                expect (callbackExited.load(), "Clearing returned before the audio callback finished");
+                releaser.join();
+                expect (! device->isPlaying());
+                expectEquals (client.stops, 1);
+                expectEquals (client.errors, 0);
+                device->close();
+                expectEquals (client.stops, 1);
+            }
+        }
+
+        enum class Operation { stop, close, clearCallback, reopen };
+        const auto operations = { Operation::stop, Operation::close, Operation::clearCallback, Operation::reopen };
+        const auto operationName = [] (Operation operation)
+        {
+            switch (operation)
+            {
+                case Operation::stop:          return "stop";
+                case Operation::close:         return "close";
+                case Operation::clearCallback: return "start nullptr";
+                case Operation::reopen:        return "open while running";
+            }
+            return "";
+        };
+        const auto openOutput = [this] (OboeAudioIODevice& device)
+        {
+            const auto error = device.open ({}, BigInteger (3), 48000, 1920);
+            expect (error.isEmpty(), error);
+            return error.isEmpty();
+        };
+        const auto perform = [&] (Operation operation, OboeAudioIODevice& device) -> String
+        {
+            switch (operation)
+            {
+                case Operation::stop:          device.stop(); break;
+                case Operation::close:         device.close(); break;
+                case Operation::clearCallback: device.start (nullptr); break;
+                case Operation::reopen:        return device.open ({}, BigInteger (3), 48000, 1920);
+            }
+            return {};
+        };
+
+        for (const auto operation : operations)
+            for (const auto action : { Action::none, Action::stop, Action::close, Action::destroy })
+            {
+                beginTest (String ("Explicit stop: ") + operationName (operation) + "; client " + name (action));
+                Callback client;
+                auto device = makeDevice();
+                if (! openOutput (*device)) continue;
+                client.stopped = [&]
+                {
+                    expect (! device->isPlaying());
+                    if (operation == Operation::close || operation == Operation::reopen)
+                        expect (! device->isOpen());
+                    act (action, device);
+                };
+                device->start (&client);
+                expectEquals (client.starts, 1);
+                expectEquals (client.stops, 0);
+                expectEquals (client.errors, 0);
+                const auto result = perform (operation, *device);
+                expect (result.isNotEmpty() == (operation == Operation::reopen && action != Action::none));
+                expectEquals (client.stops, 1);
+                if (device != nullptr)
+                {
+                    expect (! device->isPlaying());
+                    client.stopped = {};
+                    device->stop();
+                    device->close();
+                    expectEquals (client.stops, 1);
+                }
+            }
+
+        for (const auto operation : operations)
+        {
+            beginTest (String ("Explicit stop preserves client replacement: ") + operationName (operation));
+            Callback client, replacement;
+            auto device = makeDevice();
+            if (! openOutput (*device)) continue;
+            client.stopped = [&]
+            {
+                if (openOutput (*device)) device->start (&replacement);
+            };
+            device->start (&client);
+            const auto result = perform (operation, *device);
+            expect (result.isNotEmpty() == (operation == Operation::reopen));
+            expectEquals (client.starts, 1);
+            expectEquals (client.stops, 1);
+            expectEquals (client.errors, 0);
+            expectEquals (replacement.starts, 1);
+            expectEquals (replacement.stops, 0);
+            expectEquals (replacement.errors, 0);
+            expect (device->isOpen() && device->isPlaying());
+            expect (device->getLastError().isEmpty());
+            device->stop();
+            expectEquals (replacement.stops, 1);
+            device->close();
+            expectEquals (replacement.stops, 1);
+        }
+    }
+
     static void onMessageThread (const std::function<void()>& fn)
     {
         MessageManager::getInstance()->callFunctionOnMessageThread ([] (void* context) -> void*
@@ -440,8 +691,9 @@ private:
             if (processing) processing();
             for (int i = 0; i < channels; ++i)
                 FloatVectorOperations::clear (output[i], frames);
+            if (finished) finished();
         }
-        std::function<void()> preparing, stopped, processing, failed;
+        std::function<void()> preparing, stopped, processing, finished, failed;
         int starts = 0, stops = 0, errors = 0;
     };
 };

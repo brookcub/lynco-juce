@@ -1,12 +1,16 @@
-# Oboe lifecycle regression tests (P016)
+# Oboe lifecycle regression tests
 
 These Android hardware tests open real system-default input/output streams. They
 write silence and discard microphone samples. Run on a development phone with no
 other audio test running. They require a 48 kHz route. With microphone permission
-denied, the runner instead checks permission rejection and output-only opening.
+denied, the runner checks permission rejection and the output-only lifecycle tests.
 
 Use a JUCE Android GUI application target with this directory's `Main.cpp` as its
 entry point, linking `juce_audio_devices` and `juce_gui_basics` from this checkout.
+When packaging the supplied `com.rmsl.juce.JuceActivity` Java class, also link
+`juce_gui_extra`, define `JUCE_PUSH_NOTIFICATIONS=1` and
+`JUCE_PUSH_NOTIFICATIONS_ACTIVITY="com/rmsl/juce/JuceActivity"`, and name the native
+library `juce_jni`, matching that activity's JNI bootstrap.
 Define `JUCE_UNIT_TESTS=1` for the entire target and enable RECORD_AUDIO in the
 Android manifest. Use a separate application ID, not an installed product's ID.
 Build and install the Debug ARM64 APK, grant microphone permission, and launch it.
@@ -24,6 +28,17 @@ notification tests.
 
 Coverage:
 
+- Explicit stop, close, `start(nullptr)`, and reopening a running device each send
+  one stopped notification. Repeated closure does not duplicate it. The callback
+  observes stopped/closed state; recursive stop/close, deletion, and replacement
+  during that notification safely supersede the outer operation.
+- Starting again after stop or `start(nullptr)` recreates native streams and their
+  error handler before preparation; both output-only and duplex streams process
+  audio again. Starting a closed device reports an error without preparing it.
+- A cancelled outer open returns an error without changing a replacement device's
+  last error. Repeating start with the same callback during processing is a no-op;
+  replacing or clearing it waits for the old invocation to finish. Output is silent
+  when callback replacement holds the audio mutex.
 - `isPlaying()` remains true inside a real audio callback and becomes false on stop.
 - `isOpen()` completes inside a real audio callback while the lifecycle lock is held;
   stopping preserves open state, and closing clears it.

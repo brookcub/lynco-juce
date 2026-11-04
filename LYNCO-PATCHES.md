@@ -242,3 +242,95 @@ An app that defines a macro does so at its own build boundary (for example `targ
   3. Locked and unlocked in portrait: no screen-size notification; the layout stayed the same.
   4. Rotated while unlocked, portrait to landscape and back: each rotation laid out correctly, as before.
   5. Not tested: multi-window or freeform, API 29 and below (unchanged code path), a recreated Activity.
+
+### P016: Report Oboe startup failures and retain error-callback lifetime
+
+- **Files:** `modules/juce_audio_devices/native/juce_Oboe_android.cpp`, its adjacent
+  `_test.cpp`, and the runner/instructions in `extras/OboeLifecycleTests`.
+- **Startup:** propagate Oboe's `requestStart()` result without imposing a start deadline,
+  propagate input/output failure, close partial streams, and pair preparation with a
+  stopped notification before reporting the error. The device reports closed/stopped
+  state; `AudioDeviceManager` already reads `getLastError()` after starting.
+  A slow transition to Started is not a failure. The reported AAudio -899 is
+  ErrorDisconnected and requestStart returns it directly. A successful request can
+  still fail asynchronously; the output error callback and input read path cover that.
+  Latency-support flags are prepared before starting either stream, because callbacks
+  can arrive before requestStart returns. No callback/error from a stalled native
+  stream cannot be diagnosed here; no timeout, polling or stall detector is added.
+- **Lifetime:** shared error callbacks outlive native streams and queued message-thread
+  dispatch. A shared control object serializes lifecycle operations and survives device
+  deletion. Stopping detaches the session callback; destruction clears its owner. Late
+  messages cannot reopen a stopped device or access a deleted owner. Client notifications
+  are lifecycle boundaries: the retained control checks ownership and a lifecycle revision
+  before continuing after preparation or stopped notifications. Explicit stop/close,
+  replacement startup, and destruction cancel the interrupted operation. Terminal callbacks
+  may delete the device while the retained control object keeps synchronization valid.
+- **Query contract:** `isOpen()` and `isPlaying()` read existing state flags atomically.
+  These are independent snapshots, not publication of session or configuration state.
+  Lifecycle operations and `getLastError()` are serialized. Never call getLastError()
+  from the audio callback: stop holds the
+  control lock while waiting for audioCallbackMutex, which the callback holds.
+  Lending the client callback
+  to the audio thread cannot temporarily report stopped playback.
+  Other session/configuration getters still require caller serialization with lifecycle
+  changes; P016 does not make them safe for arbitrary concurrent queries.
+- **Input validity:** missing microphone permission returns before session creation.
+  Short, zero and failed reads silence unavailable input frames before referencing or
+  converting the full callback block. Timestamp calculations retain the actual read count.
+  Scratch buffers cover the requested and both native stream capacities; callbacks do
+  not resize them. A callback beyond that capacity emits silence without accessing scratch.
+- **Recovery:** preserves JUCE's existing automatic reopen policy for ErrorDisconnected,
+  including the lifecycle notifications provided by P010. Input disconnection now uses
+  that same path. P016 adds no retry budget, cooldown or delayed retry. A failed reopen
+  reports an error; a later disconnection can trigger recovery again.
+  Blocking Oboe input has no native error
+  callback. A session-owned worker waits on a POSIX semaphore; the serialized audio
+  callback posts it at most once, without allocation, locks, logging or message posting.
+  The worker forwards to the same retained error callback as output disconnection.
+  Stop detaches and quiesces audio before joining the worker; the worker never takes
+  the control lock. Semaphore/thread setup failure is reported as startup failure.
+  Other read errors (including transient startup errors) only produce zero-filled input.
+  ErrorDisconnected remains terminal even before the first successful input read;
+  requiring earlier input would hide a disconnected stream that never became live.
+  Replaces P010's raw session callback and AsyncUpdater; P012's error forwarding remains.
+  Only explicit disconnection uses this recovery; other read errors only zero-fill.
+- **Verification:** ARM64 Android Debug builds and Pixel 7 Android 16 execution.
+  Natural disconnected-start failures established the reporting defect. Controlled
+  real-stream startup tests covered both directions, partial cleanup, notification order,
+  repeated close, reopen, and worker-thread callback-triggered deletion. A delayed native
+  Bluetooth-disconnect callback was safely delivered after device deletion. Controlled
+  disconnect tests verified successful recovery, stopped-device cancellation, and queued
+  cancellation after worker deletion. The retained Android hardware suite reproduces the
+  previous patch's unwanted reopen after client closure (three failed assertions). The
+  b1a60fc0 suite passed 409 assertions with microphone permission and 298 without it:
+  recovery cancellation/deletion, client replacement, preparation cancellation, real
+  input/output ErrorClosed startup failures, playback state during an actual callback,
+  permission rejection and output-only opening, and scratch-buffer bounds. Synthetic
+  read results test full/partial/zero/error input for mono/stereo float and int16 buffers.
+  Restoring the old buffer, playback-query and permission behaviors fails 133 assertions
+  with permission and 134 without; restoring the fixes passes again.
+  Recovery errors in this suite are injected at the backend entry point; this
+  does not requalify native error timing. Unit-test code is excluded from normal builds.
+  The retained suite also covers the input semaphore path from a real audio callback:
+  duplicate notification coalescing, non-disconnection errors, cancellation on deletion,
+  successful reopen and a failed reopen that reports one terminal error.
+  The requestStart/input-disconnection revision at 5833ae0 passed 453 assertions with
+  microphone permission and 298 without. The additional open-state regression holds
+  the lifecycle lock while a real audio callback calls isOpen(), then checks stop/close.
+  Restoring the locking getter fails exactly that contention assertion (457 pass, one
+  fail); the runner still exits normally and the Pixel audio-service PID stays unchanged.
+  With the atomic getter, the expanded suite passes 458 assertions with microphone
+  permission and 298 without, with zero failures.
+  A natural Release comparison used Tribit A2DP playback and the Pixel microphone:
+  30 launches each at baseline c2a16c6 and 5833ae0. Both hit native -899 on four launches;
+  baseline recovered one, P016 all four. Baseline had three silent dead-audio outcomes;
+  P016 had none and one separate, visible session-creation failure. Most launches followed
+  an audio-service restart caused by force-stop; this is not a clean-launch comparison.
+  A separate native recorder naturally disconnected the input while the audio service
+  stayed alive. Baseline input froze without an error. P016 attempted one reopen, reported
+  its failure once while the recorder still held the microphone, and manual Retry restored
+  live input after the recorder exited. Natural automatic-reopen success after a running
+  input disconnect remains unverified; injected tests cover that path.
+  Application recovery and clean smoke checks are recorded by the consuming application's PR.
+  Other Android versions/devices and desktop audio were not qualified. This patch does
+  not fix the separately reproduced vendor MMAP process-death cleanup crash.

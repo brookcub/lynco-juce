@@ -32,6 +32,8 @@
   ==============================================================================
 */
 
+#include <semaphore.h>
+
 #ifndef JUCE_OBOE_LOG_ENABLED
  #define JUCE_OBOE_LOG_ENABLED 1
 #endif
@@ -136,8 +138,7 @@ static String getOboeString (const Type& value)
 }
 
 //==============================================================================
-class OboeAudioIODevice final : public AudioIODevice,
-                               private AsyncUpdater
+class OboeAudioIODevice final : public AudioIODevice
 {
 public:
     //==============================================================================
@@ -160,6 +161,8 @@ public:
 
     ~OboeAudioIODevice() override
     {
+        const ScopedLock lock (control->mutex);
+        control->owner = nullptr;
         close();
     }
 
@@ -206,6 +209,7 @@ public:
     String open (const BigInteger& inputChannels, const BigInteger& outputChannels,
                  double requestedSampleRate, int bufferSize) override
     {
+        const ScopedLock lock (control->mutex);
         close();
 
         lastError.clear();
@@ -235,7 +239,7 @@ public:
             // If you hit this assert, you probably forgot to get RuntimePermissions::recordAudio
             // before trying to open an audio input device. This is not going to work!
             jassertfalse;
-            lastError = "Error opening Oboe input device: the app was not granted android.permission.RECORD_AUDIO";
+            return lastError = "Error opening Oboe input device: the app was not granted android.permission.RECORD_AUDIO";
         }
 
         // At least one output channel should be set!
@@ -254,16 +258,17 @@ public:
         return lastError;
     }
 
-    void close() override                               { stop(); }
+    void close() override                               { const ScopedLock lock (control->mutex); stop(); deviceOpen = false; }
+    // Session/configuration queries require caller serialization with lifecycle operations.
     int getOutputLatencyInSamples() override            { return session != nullptr ? session->getOutputLatencyInSamples() : 0; }
     int getInputLatencyInSamples() override             { return session != nullptr ? session->getInputLatencyInSamples() : 0; }
-    bool isOpen() override                              { return deviceOpen; }
+    bool isOpen() override                              { return deviceOpen.load (std::memory_order_relaxed); }
     int getCurrentBufferSizeSamples() override          { return actualBufferSize; }
     int getCurrentBitDepth() override                   { return session != nullptr ? session->getCurrentBitDepth() : 0; }
     BigInteger getActiveOutputChannels() const override { return activeOutputChans; }
     BigInteger getActiveInputChannels() const override  { return activeInputChans; }
-    String getLastError() override                      { return lastError; }
-    bool isPlaying() override                           { return callback.get() != nullptr; }
+    String getLastError() override                      { const ScopedLock lock (control->mutex); return lastError; }
+    bool isPlaying() override                           { return running.load (std::memory_order_relaxed); }
     int getXRunCount() const noexcept override          { return session != nullptr ? session->getXRunCount() : -1; }
 
     int getDefaultBufferSize() override
@@ -278,10 +283,63 @@ public:
 
     void start (AudioIODeviceCallback* newCallback) override
     {
+        const auto state = control;
+        const ScopedLock lock (state->mutex);
+        ++state->lifecycle;
+        const auto error = startInternal (newCallback);
+        if (error.isNotEmpty())
+            newCallback->audioDeviceError (error);
+    }
+
+    void stop() override
+    {
+        const ScopedLock lock (control->mutex);
+        ++control->lifecycle;
+        if (session != nullptr)
+            session->stop();
+
+        running = false;
+        setCallback (nullptr);
+    }
+
+    bool setAudioPreprocessingEnabled (bool) override
+    {
+        // Oboe does not expose this setting, yet it may use preprocessing
+        // for older APIs running OpenSL
+        return false;
+    }
+
+    static const char* const oboeTypeName;
+
+private:
+    template <typename SampleType>
+    static int prepareInputBuffer (SampleType* nativeBuffer, AudioBuffer<float>& buffer,
+                                   int numFrames, oboe::ResultWithValue<int32_t> result)
+    {
+        const auto framesRead = result ? result.value() : 0;
+        const auto channels = buffer.getNumChannels();
+        jassert (framesRead >= 0 && framesRead <= numFrames);
+
+        // A nonblocking read may leave part or all of the previous block untouched.
+        std::fill (nativeBuffer + framesRead * channels, nativeBuffer + numFrames * channels, SampleType {});
+        if (! OboeAudioIODeviceBufferHelpers<SampleType>::referAudioBufferDirectlyToOboeIfPossible (nativeBuffer, buffer, numFrames))
+            OboeAudioIODeviceBufferHelpers<SampleType>::convertFromOboe (nativeBuffer, buffer, numFrames);
+
+        return framesRead;
+    }
+
+    String startInternal (AudioIODeviceCallback* newCallback)
+    {
         if (callback.get() != newCallback)
         {
+            const auto state = control;
             if (newCallback != nullptr)
+            {
+                const auto lifecycle = state->lifecycle;
                 newCallback->audioDeviceAboutToStart (this);
+                if (state->owner == nullptr || state->lifecycle != lifecycle)
+                    return {};
+            }
 
             AudioIODeviceCallback* oldCallback = callback.get();
 
@@ -303,36 +361,21 @@ public:
                 setCallback (newCallback);
                 running = true;
 
-                session->start();
+                if (const auto result = session->start(); result != oboe::Result::OK)
+                {
+                    close();
+                    const auto message = "Unable to start audio stream: " + getOboeString (result);
+                    lastError = message;
+                    const auto lifecycle = state->lifecycle;
+                    newCallback->audioDeviceStopped();
+                    return state->owner != nullptr && state->lifecycle == lifecycle ? message : String();
+                }
             }
 
-            callback = newCallback;
         }
+        return {};
     }
 
-    void stop() override
-    {
-        // An error noted before this stop is out of date: whatever it broke is gone.
-        pendingStreamError = oboe::Result::OK;
-        cancelPendingUpdate();
-
-        if (session != nullptr)
-            session->stop();
-
-        running = false;
-        setCallback (nullptr);
-    }
-
-    bool setAudioPreprocessingEnabled (bool) override
-    {
-        // Oboe does not expose this setting, yet it may use preprocessing
-        // for older APIs running OpenSL
-        return false;
-    }
-
-    static const char* const oboeTypeName;
-
-private:
     StringArray getChannelNames (bool forInput)
     {
         auto& deviceId = forInput ? inputDeviceId : outputDeviceId;
@@ -466,53 +509,116 @@ private:
     }
 
     //==============================================================================
-    /*  Oboe reports a failed stream on its own error thread, where the device must not be
-        stopped and reopened or the app called. The session hands the error to streamFailed(),
-        which only records it and asks for the message thread. There the device is stopped and,
-        after a disconnect, reopened with the settings it had, through the same stop(), open()
-        and start() that an app would use: the callback hears audioDeviceStopped(), then either
-        audioDeviceAboutToStart() on the reopened device, or audioDeviceError().
-
-        The audio callback cannot race this. The failed output stream was closed by Oboe before
-        the error was reported, so it is not running, and the streams are only destroyed by the
-        session's stop(), which holds the session's audioCallbackMutex.
-    */
-    void streamFailed (oboe::Result error)
+    struct Control
     {
-        // Keep the first error until the message thread has dealt with it.
-        auto expected = oboe::Result::OK;
-        pendingStreamError.compare_exchange_strong (expected, error);
+        explicit Control (OboeAudioIODevice& device) : owner (&device) {}
+        CriticalSection mutex;
+        OboeAudioIODevice* owner;
+        uint64 lifecycle = 0;
+    };
 
-        triggerAsyncUpdate();
-    }
-
-    void handleAsyncUpdate() override
+    // Native error callbacks and queued messages can outlive their session and device.
+    struct ErrorCallback final : oboe::AudioStreamErrorCallback,
+                                 std::enable_shared_from_this<ErrorCallback>
     {
-        const auto error = pendingStreamError.exchange (oboe::Result::OK);
+        explicit ErrorCallback (std::shared_ptr<Control> state) : control (std::move (state)) {}
+
+        void detach()
+        {
+            const ScopedLock lock (control->mutex);
+            attached = false;
+        }
+
+        void onErrorAfterClose (oboe::AudioStream*, oboe::Result error) override
+        {
+            MessageManager::callAsync ([self = shared_from_this(), error]
+            {
+                const ScopedLock lock (self->control->mutex);
+                if (self->attached && self->control->owner != nullptr)
+                {
+                    const auto failure = self->control->owner->handleStreamError (error);
+                    if (failure.first != nullptr)
+                        failure.first->audioDeviceError (failure.second);
+                }
+            });
+        }
+
+        std::shared_ptr<Control> control;
+        bool attached = true;
+    };
+
+    // A blocking input stream has no Oboe error callback. Only this worker posts
+    // messages; the audio thread wakes it once using the non-blocking sem_post.
+    class InputErrorDispatcher final : private Thread
+    {
+    public:
+        explicit InputErrorDispatcher (std::shared_ptr<ErrorCallback> callbackIn)
+            : Thread ("Oboe input error"), errorCallback (std::move (callbackIn)),
+              semaphoreReady (sem_init (&semaphore, 0, 0) == 0) {}
+
+        ~InputErrorDispatcher() override
+        {
+            if (semaphoreReady)
+            {
+                signalThreadShouldExit();
+                sem_post (&semaphore);
+                stopThread (-1);
+                sem_destroy (&semaphore);
+            }
+        }
+
+        bool start() { return semaphoreReady && startThread(); }
+
+        void report (oboe::Result error)
+        {
+            if (error == oboe::Result::ErrorDisconnected && ! std::exchange (reported, true))
+                sem_post (&semaphore);
+        }
+
+    private:
+        void run() override
+        {
+            int result;
+            do { result = sem_wait (&semaphore); } while (result != 0 && errno == EINTR);
+            if (result == 0 && ! threadShouldExit())
+                errorCallback->onErrorAfterClose (nullptr, oboe::Result::ErrorDisconnected);
+        }
+
+        const std::shared_ptr<ErrorCallback> errorCallback;
+        sem_t semaphore;
+        const bool semaphoreReady;
+        bool reported = false; // Accessed only by the serialized audio callback.
+    };
+
+    std::pair<AudioIODeviceCallback*, String> handleStreamError (oboe::Result error)
+    {
+        // process() temporarily takes the callback; quiesce before reading it.
+        session->stop();
         auto* callbackToRestore = callback.get();
-
-        // The device was stopped, or opened again, after the error was noted.
-        if (error == oboe::Result::OK || callbackToRestore == nullptr)
-            return;
+        if (callbackToRestore == nullptr)
+            return {};
 
         const auto inputChannels  = activeInputChans;
         const auto outputChannels = activeOutputChans;
         const auto rate           = (double) sampleRate;
         const auto bufferSize     = actualBufferSize;
+        stop();
+        const auto state = control;
+        const auto lifecycle = state->lifecycle;
+        callbackToRestore->audioDeviceStopped();
 
-        start (nullptr);
+        // Client callbacks may destroy the device or supersede this recovery.
+        if (state->owner == nullptr || state->lifecycle != lifecycle)
+            return {};
 
         String message;
-
         if (error == oboe::Result::ErrorDisconnected)
         {
             message = open (inputChannels, outputChannels, rate, bufferSize);
-
             if (message.isEmpty())
-            {
-                start (callbackToRestore);
-                return;
-            }
+                message = startInternal (callbackToRestore);
+            if (message.isEmpty())
+                return {};
 
             message = "Unable to reopen the audio device after it was disconnected: " + message;
         }
@@ -523,7 +629,7 @@ private:
 
         deviceOpen = false;
         lastError = message;
-        callbackToRestore->audioDeviceError (message);
+        return { callbackToRestore, message };
     }
 
     //==============================================================================
@@ -534,10 +640,11 @@ private:
                     oboe::SharingMode sharingMode,
                     int channelCount, oboe::AudioFormat format,
                     int32 sampleRateIn, int32 bufferSize,
-                    oboe::AudioStreamCallback* callbackIn = nullptr)
+                    oboe::AudioStreamCallback* callbackIn = nullptr,
+                    std::shared_ptr<ErrorCallback> errorCallback = {})
         {
             open (deviceId, direction, sharingMode, channelCount,
-                  format, sampleRateIn, bufferSize, callbackIn);
+                  format, sampleRateIn, bufferSize, callbackIn, std::move (errorCallback));
         }
 
         ~OboeStream()
@@ -550,20 +657,13 @@ private:
             return openResult == oboe::Result::OK;
         }
 
-        void start()
+        oboe::Result start()
         {
             jassert (openedOk());
 
             if (openedOk() && stream != nullptr)
             {
-                auto expectedState = oboe::StreamState::Starting;
-                auto nextState = oboe::StreamState::Started;
-                int64 timeoutNanos = 1000 * oboe::kNanosPerMillisecond;
-
-                [[maybe_unused]] auto startResult = stream->requestStart();
-                JUCE_OBOE_LOG ("Requested Oboe stream start with result: " + getOboeString (startResult));
-
-                startResult = stream->waitForStateChange (expectedState, &nextState, timeoutNanos);
+                const auto startResult = stream->requestStart();
 
                 JUCE_OBOE_LOG ("Starting Oboe stream with result: " + getOboeString (startResult)
                                  + "\nUses AAudio = " + String ((int) stream->usesAAudio())
@@ -580,7 +680,10 @@ private:
                                  + "\nBytesPerSample = " + String (stream->getBytesPerSample())
                                  + "\nPerformanceMode = " + getOboeString (stream->getPerformanceMode())
                                  + "\ngetDeviceId = " + String (stream->getDeviceId()));
+                return startResult;
             }
+
+            return openResult != oboe::Result::OK ? openResult : oboe::Result::ErrorClosed;
         }
 
         std::shared_ptr<oboe::AudioStream> getNativeStream() const
@@ -609,7 +712,8 @@ private:
                    oboe::SharingMode sharingMode,
                    int channelCount, oboe::AudioFormat format,
                    int32 newSampleRate, int32 newBufferSize,
-                   oboe::AudioStreamCallback* newCallback = nullptr)
+                   oboe::AudioStreamCallback* newCallback,
+                   std::shared_ptr<ErrorCallback> errorCallback)
         {
             oboe::DefaultStreamValues::FramesPerBurst = AndroidHighPerformanceAudioHelpers::getNativeBufferSizeHint();
 
@@ -639,6 +743,9 @@ private:
            #else
             builder.setCallback (newCallback);
            #endif
+
+            if (errorCallback != nullptr)
+                builder.setErrorCallback (std::move (errorCallback));
 
             JUCE_OBOE_LOG (String ("Preparing Oboe stream with params:")
                  + "\nAAudio supported = " + String (int (builder.isAAudioSupported()))
@@ -703,7 +810,7 @@ private:
                                         int numInputChannels, int numOutputChannels,
                                         int sampleRate, int bufferSize);
 
-        virtual void start() = 0;
+        virtual oboe::Result start() = 0;
         virtual void stop() = 0;
         virtual int getOutputLatencyInSamples() = 0;
         virtual int getInputLatencyInSamples() = 0;
@@ -729,6 +836,10 @@ private:
             return jmax (0, inputXRunCount) + jmax (0, outputXRunCount);
         }
 
+       #if JUCE_UNIT_TESTS
+        friend class OboeLifecycleTests;
+       #endif
+
     protected:
         OboeSessionBase (OboeAudioIODevice& ownerToUse,
                          int inputDeviceIdToUse, int outputDeviceIdToUse,
@@ -737,6 +848,7 @@ private:
                          oboe::AudioFormat streamFormatToUse,
                          int bitDepthToUse)
             : owner (ownerToUse),
+              errorCallback (std::make_shared<ErrorCallback> (ownerToUse.control)),
               inputDeviceId (inputDeviceIdToUse),
               outputDeviceId (outputDeviceIdToUse),
               numInputChannels (numInputChannelsToUse),
@@ -787,7 +899,8 @@ private:
                                                          streamFormat,
                                                          sampleRate,
                                                          bufferSize,
-                                                         static_cast<AudioStreamCallback*> (this));
+                                                         static_cast<AudioStreamCallback*> (this),
+                                                         errorCallback);
 
             checkStreamSetup (outputStream.get(), outputDeviceId, numOutputChannels,
                               sampleRate, bufferSize, streamFormat);
@@ -820,6 +933,7 @@ private:
         }
 
         OboeAudioIODevice& owner;
+        std::shared_ptr<ErrorCallback> errorCallback;
         int inputDeviceId, outputDeviceId;
         int numInputChannels, numOutputChannels;
         int sampleRate;
@@ -845,28 +959,41 @@ private:
                                sampleRateToUse, bufferSizeToUse,
                                OboeAudioIODeviceBufferHelpers<SampleType>::oboeAudioFormat(),
                                OboeAudioIODeviceBufferHelpers<SampleType>::bitDepth()),
-              inputStreamNativeBuffer (static_cast<size_t> (numInputChannelsToUse * getBufferCapacityInFrames (true))),
-              inputStreamSampleBuffer (numInputChannels, getBufferCapacityInFrames (true)),
-              outputStreamSampleBuffer (numOutputChannels, getBufferCapacityInFrames (false))
+              bufferCapacity (jmax (bufferSize, getBufferCapacityInFrames (true), getBufferCapacityInFrames (false))),
+              inputStreamNativeBuffer (static_cast<size_t> (numInputChannelsToUse * bufferCapacity)),
+              inputStreamSampleBuffer (numInputChannels, bufferCapacity),
+              outputStreamSampleBuffer (numOutputChannels, bufferCapacity)
         {
+            if (numInputChannels > 0)
+                inputErrorDispatcher = std::make_unique<InputErrorDispatcher> (errorCallback);
         }
 
-        void start() override
+        oboe::Result start() override
         {
-            if (inputStream != nullptr)
-                inputStream->start();
-
-            outputStream->start();
-
+            // Callbacks may begin before requestStart returns.
             isInputLatencyDetectionSupported  = isLatencyDetectionSupported (inputStream.get());
             isOutputLatencyDetectionSupported = isLatencyDetectionSupported (outputStream.get());
+            if (inputErrorDispatcher != nullptr && ! inputErrorDispatcher->start())
+                return oboe::Result::ErrorInternal;
+
+            if (inputStream != nullptr)
+                if (const auto result = inputStream->start(); result != oboe::Result::OK)
+                    return result;
+
+            if (const auto result = outputStream->start(); result != oboe::Result::OK)
+                return result;
+
+            return oboe::Result::OK;
         }
 
         void stop() override
         {
-            const SpinLock::ScopedLockType lock { audioCallbackMutex };
-
-            destroyStreams();
+            errorCallback->detach();
+            {
+                const SpinLock::ScopedLockType lock { audioCallbackMutex };
+                destroyStreams();
+            }
+            inputErrorDispatcher.reset();
         }
 
         int getOutputLatencyInSamples() override    { return outputLatency; }
@@ -898,11 +1025,14 @@ private:
 
                 std::optional<uint64_t> inputTime, outputTime;
 
-                // Read input from Oboe
-                const auto expandedBufferSize = jmax (inputStreamNativeBuffer.size(),
-                                                      static_cast<size_t> (numInputChannels * jmax (bufferSize, numFrames)));
-                inputStreamNativeBuffer.resize (expandedBufferSize);
+                // Never resize scratch buffers on the audio thread if a backend exceeds its advertised capacity.
+                if (numFrames > bufferCapacity)
+                {
+                    zeromem (audioData, (size_t) numFrames * (size_t) numOutputChannels * sizeof (SampleType));
+                    return oboe::DataCallbackResult::Continue;
+                }
 
+                // Read input from Oboe
                 if (inputStream != nullptr)
                 {
                     auto nativeInputStream = inputStream->getNativeStream();
@@ -916,27 +1046,18 @@ private:
 
                     auto result = nativeInputStream->read (inputStreamNativeBuffer.data(), numFrames, 0);
 
-                    if (result)
-                    {
-                        auto referringDirectlyToOboeData = OboeAudioIODeviceBufferHelpers<SampleType>
-                                                             ::referAudioBufferDirectlyToOboeIfPossible (inputStreamNativeBuffer.data(),
-                                                                                                         inputStreamSampleBuffer,
-                                                                                                         result.value());
+                    if (! result)
+                        inputErrorDispatcher->report (result.error());
 
-                        if (! referringDirectlyToOboeData)
-                            OboeAudioIODeviceBufferHelpers<SampleType>::convertFromOboe (inputStreamNativeBuffer.data(), inputStreamSampleBuffer, result.value());
-                    }
-                    else
-                    {
-                        JUCE_OBOE_LOG ("Failed to read from input stream: " + getOboeString (result.error()));
-                    }
+                    const auto framesRead = prepareInputBuffer (inputStreamNativeBuffer.data(), inputStreamSampleBuffer,
+                                                                 numFrames, result);
 
                     // The frames just read end at getFramesRead(), which is after the read.
                     const auto inputTimestamp = readTimestamp (*nativeInputStream);
                     inputTime = getInputBlockTimeNs (areDeviceTimesSupported,
                                                      [&] (int64_t& position, int64_t& time) { return inputTimestamp.get (position, time); },
                                                      [&] { return nativeInputStream->getFramesRead(); },
-                                                     result ? (int64_t) result.value() : 0,
+                                                     (int64_t) framesRead,
                                                      nativeInputStream->getSampleRate());
 
                     if (isInputLatencyDetectionSupported)
@@ -981,23 +1102,7 @@ private:
             return oboe::DataCallbackResult::Continue;
         }
 
-        void printStreamDebugInfo ([[maybe_unused]] oboe::AudioStream* stream)
-        {
-            JUCE_OBOE_LOG ("\nUses AAudio = " + (stream != nullptr ? String ((int) stream->usesAAudio()) : String ("?"))
-                 + "\nDirection = " + (stream != nullptr ? getOboeString (stream->getDirection()) : String ("?"))
-                 + "\nSharingMode = " + (stream != nullptr ? getOboeString (stream->getSharingMode()) : String ("?"))
-                 + "\nChannelCount = " + (stream != nullptr ? String (stream->getChannelCount()) : String ("?"))
-                 + "\nFormat = " + (stream != nullptr ? getOboeString (stream->getFormat()) : String ("?"))
-                 + "\nSampleRate = " + (stream != nullptr ? String (stream->getSampleRate()) : String ("?"))
-                 + "\nBufferSizeInFrames = " + (stream != nullptr ? String (stream->getBufferSizeInFrames()) : String ("?"))
-                 + "\nBufferCapacityInFrames = " + (stream != nullptr ? String (stream->getBufferCapacityInFrames()) : String ("?"))
-                 + "\nFramesPerBurst = " + (stream != nullptr ? String (stream->getFramesPerBurst()) : String ("?"))
-                 + "\nFramesPerCallback = " + (stream != nullptr ? String (stream->getFramesPerCallback()) : String ("?"))
-                 + "\nBytesPerFrame = " + (stream != nullptr ? String (stream->getBytesPerFrame()) : String ("?"))
-                 + "\nBytesPerSample = " + (stream != nullptr ? String (stream->getBytesPerSample()) : String ("?"))
-                 + "\nPerformanceMode = " + (stream != nullptr ? getOboeString (stream->getPerformanceMode()) : String ("?"))
-                 + "\ngetDeviceId = " + (stream != nullptr ? String (stream->getDeviceId()) : String ("?")));
-        }
+
 
         // On API 30 and later each stream's timestamp is read once per callback, and gives both
         // its device time and its latency.
@@ -1087,32 +1192,17 @@ private:
             return time.tv_sec * oboe::kNanosPerSecond + time.tv_nsec;
         }
 
-        void onErrorBeforeClose (oboe::AudioStream* stream, [[maybe_unused]] oboe::Result error) override
-        {
-            // only output stream should be the master stream receiving callbacks
-            jassert (stream->getDirection() == oboe::Direction::Output);
-
-            JUCE_OBOE_LOG ("Oboe stream onErrorBeforeClose(): " + getOboeString (error));
-            printStreamDebugInfo (stream);
-        }
-
-        void onErrorAfterClose (oboe::AudioStream* stream, oboe::Result error) override
-        {
-            // only output stream should be the master stream receiving callbacks
-            jassert (stream->getDirection() == oboe::Direction::Output);
-
-            JUCE_OBOE_LOG ("Oboe stream onErrorAfterClose(): " + getOboeString (error));
-
-            // This is Oboe's error thread: leave the recovery to the device, on the message thread.
-            owner.streamFailed (error);
-        }
-
         void destroyStreams()
         {
             inputStream = nullptr;
             outputStream = nullptr;
         }
 
+       #if JUCE_UNIT_TESTS
+        friend class OboeLifecycleTests;
+       #endif
+        const int bufferCapacity;
+        std::unique_ptr<InputErrorDispatcher> inputErrorDispatcher;
         std::vector<SampleType> inputStreamNativeBuffer;
         AudioBuffer<float> inputStreamSampleBuffer,
                            outputStreamSampleBuffer;
@@ -1131,10 +1221,13 @@ private:
     //==============================================================================
     friend class OboeAudioIODeviceType;
     friend class OboeRealtimeThread;
+   #if JUCE_UNIT_TESTS
+    friend class OboeLifecycleTests;
+   #endif
 
     //==============================================================================
     int actualBufferSize = 0, sampleRate = 0;
-    bool deviceOpen = false;
+    std::atomic<bool> deviceOpen { false };
     String lastError;
     BigInteger activeOutputChans, activeInputChans;
     Atomic<AudioIODeviceCallback*> callback { nullptr };
@@ -1146,11 +1239,11 @@ private:
     Array<int> supportedOutputSampleRates;
     int maxNumOutputChannels;
 
+    const std::shared_ptr<Control> control = std::make_shared<Control> (*this);
     std::unique_ptr<OboeSessionBase> session;
 
-    bool running = false;
+    std::atomic<bool> running { false };
 
-    std::atomic<oboe::Result> pendingStreamError { oboe::Result::OK };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (OboeAudioIODevice)
 };
@@ -1579,3 +1672,7 @@ RealtimeThreadFactory getAndroidRealtimeThreadFactory()
 }
 
 } // namespace juce
+
+#if JUCE_UNIT_TESTS
+ #include "juce_Oboe_android_test.cpp"
+#endif

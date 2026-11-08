@@ -291,9 +291,10 @@ public:
                 if (newCallback == nullptr)
                     stop();
                 else
+                {
                     setCallback (newCallback);
-
-                oldCallback->audioDeviceStopped();
+                    oldCallback->audioDeviceStopped();
+                }
             }
             else
             {
@@ -320,7 +321,10 @@ public:
             session->stop();
 
         running = false;
+        auto* stopped = callback.get();
         setCallback (nullptr);
+        if (stopped != nullptr)
+            stopped->audioDeviceStopped();
     }
 
     bool setAudioPreprocessingEnabled (bool) override

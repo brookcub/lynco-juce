@@ -103,7 +103,7 @@ An app that defines a macro does so at its own build boundary (for example `targ
      ./gradlew --no-daemon -Pandroid.injected.build.abi=x86_64 assembleDebug_Debug
      ```
      APK: `app/build/intermediates/apk/debug_/debug/app-debug_-debug.apk`. Copy it aside as `with-P006.apk`.
-  4. Build without P006: `git checkout <P006>^ -- modules/juce_gui_basics/native/juce_Windowing_android.cpp` (`<P006>` is the commit with trailer `LynCo-Patch: P006`), rebuild as in step 3, copy the APK aside as `without-P006.apk`, then `git checkout HEAD -- modules/juce_gui_basics/native/juce_Windowing_android.cpp`.
+  4. Build without P006: `git show <P006> | git apply -R` (`<P006>` is the commit with trailer `LynCo-Patch: P006`; reverting only its diff keeps later patches to the same file), rebuild as in step 3, copy the APK aside as `without-P006.apk`, then `git checkout HEAD -- modules/juce_gui_basics/native/juce_Windowing_android.cpp`.
   5. Run each APK, repeating step 2 first:
      ```
      adb -s 127.0.0.1:5721 shell wm size 1600x2560; adb -s 127.0.0.1:5721 shell wm density 320
@@ -115,6 +115,7 @@ An app that defines a macro does so at its own build boundary (for example `targ
      adb -s 127.0.0.1:5721 exec-out screencap -p > shot.png
      ```
   6. Expected, 3 of 3 runs each: without P006 the process is gone (`pidof` prints nothing) and the log has two `Throwing OutOfMemoryError "Failed to allocate a 16384012 byte allocation ... growth limit 16777216"` lines, then `JNI DETECTED ERROR IN APPLICATION: JNI GetIntArrayElements called with pending exception java.lang.OutOfMemoryError` in `AndroidComponentPeer::handlePaintCallback`, then `Fatal signal 6 (SIGABRT)`. With P006 the same two OutOfMemoryError warnings appear, there is no JNI error or abort, `pidof` prints a pid, and the screenshot shows the painted DemoRunner start screen.
+  7. The same run with a LynCo app's Debug x86_64 build at `lynco-8.0.12.4`, 2026-10-24, 3 runs each: without P006 the app aborts the same way in 3 of 3; with it the app stays alive in 3 of 3 and paints its full screen. Not exercised: the skipped frame when not even one row fits.
 
 ### P007: Callback context carries the input sample time
 
@@ -270,8 +271,6 @@ An app that defines a macro does so at its own build boundary (for example `targ
   Lifecycle operations and `getLastError()` are serialized. Never call getLastError()
   from the audio callback: stop holds the
   control lock while waiting for audioCallbackMutex, which the callback holds.
-  Lending the client callback
-  to the audio thread cannot temporarily report stopped playback.
   Other session/configuration getters still require caller serialization with lifecycle
   changes; P016 does not make them safe for arbitrary concurrent queries.
 - **Input validity:** missing microphone permission returns before session creation.
@@ -334,11 +333,29 @@ An app that defines a macro does so at its own build boundary (for example `targ
   Application recovery and clean smoke checks are recorded by the consuming application's PR.
   Other Android versions/devices and desktop audio were not qualified. This patch does
   not fix the separately reproduced vendor MMAP process-death cleanup crash.
+- **Natural runs at `5ab7720`:** Release on Pixel 7, Bluetooth A2DP output and the
+  built-in microphone, 30 force-stop relaunches: 27 live input, 3 visible errors with
+  Retry, no silent failure (c2a16c6 had 3). 13 launches hit -899 at start; 12 recovered
+  and 1 reported its error. With P017 (`7178a57`), 30 more: 30 live input, no silent
+  failure or error; no -899 occurred.
+- **Not fixed:**
+  - A competing recorder that takes the microphone while the device runs on the
+    system default devices with a 48-sample buffer leaves input callbacks delivering
+    zeros with no error, also after the recorder exits; c2a16c6 behaves the same. With
+    explicitly selected devices and a 1920-sample buffer the same takeover reports an
+    error, and one Retry restores input.
+  - Device IDs are read when JUCE scans devices. An audio-server restart renumbers
+    Android's devices, so a later open or recovery reopen can request an ID that no
+    longer exists (Android then picks the route) or that now names another device. In
+    one of 30 launches the output opened on the speaker's Bluetooth SCO profile instead
+    of A2DP. Upstream behaviour, not changed by P016 or P017.
 
 ### P017: Notify clients when an Oboe device is explicitly stopped
 
 - **Files:** `modules/juce_audio_devices/native/juce_Oboe_android.cpp`, its adjacent
   `_test.cpp`, and the instructions in `extras/OboeLifecycleTests`.
+- **Why:** WASAPI and CoreAudio notify `audioDeviceStopped()` from `stop()`; Oboe did
+  not, so a client never learned that it had been stopped.
 - **Contract:** explicit `stop()`, `close()`, and reopening a running device notify
   the detached client exactly once, after native audio is quiescent. Stopped/closed
   state is visible before the notification. Repeated closure sends no duplicate.
@@ -367,3 +384,5 @@ An app that defines a macro does so at its own build boundary (for example `targ
   The suite covers direct stop/close, repeated closure, callback-visible state,
   recursive lifecycle calls, destruction, replacement, and existing P016 failure
   and recovery cases. Other Android devices and versions were not qualified.
+  A Release app on the same phone: selecting no input and no output stops callbacks
+  and the client is notified; selecting the defaults again restores live input.

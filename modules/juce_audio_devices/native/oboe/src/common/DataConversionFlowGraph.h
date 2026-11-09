@@ -62,6 +62,11 @@ public:
 
     int32_t onProcessFixedBlock(uint8_t *buffer, int32_t numBytes) override;
 
+    // These causal, even-tap resamplers delay the signal by half the taps in source frames.
+    int32_t getSourceDelayInFrames() const {
+        return mResampler ? mResampler->getNumTaps() / 2 : 0;
+    }
+
     DataCallbackResult getDataCallbackResult() {
         return mCallbackResult;
     }

@@ -18,6 +18,7 @@
 #define OBOE_FILTER_AUDIO_STREAM_H
 
 #include <memory>
+#include <cmath>
 #include <oboe/AudioStream.h>
 #include "DataConversionFlowGraph.h"
 
@@ -46,7 +47,8 @@ public:
             mErrorCallback = mChildStream->swapErrorCallback(this);
         }
         if (builder.isDataCallbackSpecified()) {
-            mDataCallback = mChildStream->swapDataCallback(this);
+            mAppDataCallback = mChildStream->swapDataCallback(this);
+            mDataCallback = this;
         } else {
             const int size = childStream->getFramesPerBurst() * childStream->getBytesPerFrame();
             mBlockingBuffer = std::make_unique<uint8_t[]>(size);
@@ -135,13 +137,17 @@ public:
     }
 
     void updateFramesWritten() override {
-        // TODO for output, just count local writes?
-        mFramesWritten = static_cast<int64_t>(mChildStream->getFramesWritten() * mRateScaler);
+        // Callback output advances when the application supplies a converted block.
+        if (getDirection() != Direction::Output || !isDataCallbackSpecified()) {
+            mFramesWritten = static_cast<int64_t>(mChildStream->getFramesWritten() * mRateScaler);
+        }
     }
 
     void updateFramesRead() override {
-        // TODO for input, just count local reads?
-        mFramesRead = static_cast<int64_t>(mChildStream->getFramesRead() * mRateScaler);
+        // Input advances when converted frames reach the application, including buffered reads.
+        if (getDirection() != Direction::Input) {
+            mFramesRead = static_cast<int64_t>(mChildStream->getFramesRead() * mRateScaler);
+        }
     }
 
     void *getUnderlyingStream() const  override {
@@ -171,10 +177,16 @@ public:
             int64_t *timeNanoseconds) override {
         int64_t childPosition = 0;
         Result result = mChildStream->getTimestamp(clockId, &childPosition, timeNanoseconds);
-        // It is OK if framePosition is null.
-        if (framePosition) {
-            *framePosition = childPosition * mRateScaler;
-        }
+        if (result != Result::OK) return result;
+        const double delay = mFlowGraph->getSourceDelayInFrames();
+        const double position = getDirection() == Direction::Output
+                ? childPosition * mRateScaler - delay
+                : (childPosition + delay) * mRateScaler;
+        const auto wholePosition = static_cast<int64_t>(std::floor(position));
+        // Preserve the same sample/time line when the converted position is fractional.
+        *timeNanoseconds += static_cast<int64_t>(std::llround(
+                (wholePosition - position) * kNanosPerSecond / getSampleRate()));
+        if (framePosition) *framePosition = wholePosition;
         return result;
     }
 
@@ -212,6 +224,7 @@ public:
 
 private:
 
+    AudioStreamDataCallback                *mAppDataCallback = nullptr;
     std::shared_ptr<AudioStream>             mChildStream; // this stream wraps the child stream
     std::unique_ptr<DataConversionFlowGraph> mFlowGraph; // for converting data
     std::unique_ptr<uint8_t[]>               mBlockingBuffer; // temp buffer for write()

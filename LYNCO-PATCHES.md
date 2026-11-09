@@ -386,3 +386,35 @@ An app that defines a macro does so at its own build boundary (for example `targ
   and recovery cases. Other Android devices and versions were not qualified.
   A Release app on the same phone: selecting no input and no output stops callbacks
   and the client is notified; selecting the defaults again restores live input.
+
+### P018: Associate converted Oboe timestamps with application frames
+
+- **Files:** bundled Oboe `FilterAudioStream.{h,cpp}` and
+  `DataConversionFlowGraph.h`; standalone regression in `extras/OboeTimingTests`.
+- **Why:** scaled child counters are not application delivery cursors. A 96 kHz
+  application can receive two blocks during one 48 kHz child callback; both used
+  the same timestamp target. Buffered input reads have the corresponding defect.
+  Fractional conversion also discarded part of the timestamp pair, and the pair
+  omitted the causal sample-rate converter delay.
+- **Contract:** count callback-output frames when supplied by the application and
+  input frames when consumed by it. Preserve the existing child counters for the
+  opposite sides and for blocking output. Project native timestamp pairs through
+  the converter's source-frame delay and preserve fractional position in time.
+  Failed native timestamp queries remain failures. No clock estimator, recovery
+  policy, retry or application lifecycle changes.
+- **Verification:** Android arm64 Release with NDK 28.1.13356709, Pixel 7.
+  The actual converter regression passes 108 checks: integer/fractional/equal
+  rates, buffered/short/empty reads, counter continuity, failed queries and smooth
+  pulse timing through all five conversion qualities. Expected pulse timing is
+  independent of the wrapper counters. Largest measured discrepancy was 0.006
+  native frame (tolerance 0.02). The unmodified baseline fails 76 of those 108 checks. Test source and commands are in `extras/OboeTimingTests`.
+  A separate Release recorder using these production changes captured 23,461
+  callbacks across 44.1/48/96 kHz on Pixel speaker/microphone, with no adjacent
+  repeated/backward available context timestamps and no recorder loss/errors.
+- **Limits:** counter restart coverage uses deterministic streams. Physical
+  restart/flush behavior, blocking output writes, acoustic ADC/DAC timing, other
+  devices and an application consuming these times are not qualified by these tests.
+  This does not validate arbitrary native timestamps. A separate existing defect
+  is reproduced by `--require-read-errors`: the conversion graph can swallow a
+  native ErrorDisconnected read as a successful empty read. It is not repaired
+  by this timing change.

@@ -88,12 +88,22 @@ ResultWithValue<int32_t> FilterAudioStream::read(void *buffer,
                                                   int32_t numFrames,
                                                   int64_t timeoutNanoseconds) {
     int32_t framesRead = mFlowGraph->read(buffer, numFrames, timeoutNanoseconds);
+    if (framesRead > 0) mFramesRead += framesRead;
     return ResultWithValue<int32_t>::createBasedOnSign(framesRead);
 }
 
 DataCallbackResult FilterAudioStream::onAudioReady(AudioStream *oboeStream,
                                 void *audioData,
                                 int32_t numFrames) {
+    // The flowgraph calls us again for each application block inside a child callback.
+    if (oboeStream == this) {
+        const auto result = mAppDataCallback->onAudioReady(this, audioData, numFrames);
+        if (result == DataCallbackResult::Continue) {
+            if (getDirection() == Direction::Input) mFramesRead += numFrames;
+            else mFramesWritten += numFrames;
+        }
+        return result;
+    }
     int32_t framesProcessed;
     if (oboeStream->getDirection() == Direction::Output) {
         framesProcessed = mFlowGraph->read(audioData, numFrames, 0 /* timeout */);

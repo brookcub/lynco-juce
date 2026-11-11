@@ -204,4 +204,40 @@ inline std::optional<AudioIODeviceTimestamp> getAsioProcessingCycle ([[maybe_unu
     return {};
 }
 
+//==============================================================================
+/** One snd_pcm_htimestamp reading: availFrames were available when the hardware pointer was last
+    updated, at tstamp (seconds and nanoseconds).
+*/
+struct AlsaPositionReading
+{
+    int64_t availFrames = 0;
+    int64_t seconds = 0;
+    int64_t nanoseconds = 0;
+};
+
+/*  The observation of an ALSA PCM from one coherent snd_pcm_htimestamp reading: the frame at the
+    hardware pointer, at the reading's time converted exactly to ns.
+
+    applicationFramesAtReading is the application's own count of frames transferred (read for
+    capture, written for playback) when the reading was taken, and bufferStartFrame the frame index
+    of the callback buffer's first frame in the same count. The hardware pointer is at
+    applicationFramesAtReading + availFrames for capture, and applicationFramesAtReading -
+    (ringBufferFrames - availFrames) for playback; the offset is that minus bufferStartFrame.
+
+    nullopt if there is no reading, if the PCM's timestamps are not on CLOCK_MONOTONIC (JUCE's clock
+    on Linux), or if availFrames is outside [0, ringBufferFrames] (an overrun or underrun, where the
+    count no longer describes the ring).
+
+    Stub: the patch that implements it is P022.
+*/
+inline std::optional<AudioIODeviceTimestamp> getAlsaTimestamp ([[maybe_unused]] bool isCapture,
+                                                               [[maybe_unused]] const std::optional<AlsaPositionReading>& reading,
+                                                               [[maybe_unused]] bool timestampsAreMonotonic,
+                                                               [[maybe_unused]] int64_t applicationFramesAtReading,
+                                                               [[maybe_unused]] int64_t bufferStartFrame,
+                                                               [[maybe_unused]] int64_t ringBufferFrames) noexcept
+{
+    return {};
+}
+
 } // namespace juce::CallbackTimeHelpers

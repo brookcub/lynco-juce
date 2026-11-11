@@ -465,4 +465,79 @@ private:
 
 static AsioProcessingCycleTests asioProcessingCycleTests;
 
+//==============================================================================
+/*  Acceptance tests for P022 (ALSA device timestamps). The readings are fakes; the expected
+    hardware-pointer offsets are worked by hand from the ring arithmetic in the seam's contract
+    (capture: frames transferred + avail; playback: frames transferred - (ring - avail)).
+*/
+class AlsaTimestampTests final : public UnitTest
+{
+public:
+    AlsaTimestampTests() : UnitTest ("ALSA device timestamps", UnitTestCategories::audio) {}
+
+    void runTest() override
+    {
+        // A 4096-frame ring
+        constexpr int64_t ring = 4096;
+
+        beginTest ("Capture: the frame at the hardware pointer, after the frames already read");
+        {
+            // 9600 frames read when 256 more were available: the pointer is at 9856. A buffer
+            // starting at 9600 (read just after the reading) sees it at +256.
+            expectTimestamp (getAlsaTimestamp (true, Reading { 256, 12, 345'678'901 }, true, 9600, 9600, ring), { 12'345'678'901, 256, 0 });
+
+            // The same reading seen from a buffer read before it, starting at 9088
+            expectTimestamp (getAlsaTimestamp (true, Reading { 256, 12, 345'678'901 }, true, 9600, 9088, ring), { 12'345'678'901, 768, 0 });
+        }
+
+        beginTest ("Playback: the frame at the hardware pointer, behind the frames already written");
+        {
+            // 19200 written with 1024 of the 4096 free: 3072 are queued, so the pointer is at 16128;
+            // from a buffer starting at 19200 that is -3072
+            expectTimestamp (getAlsaTimestamp (false, Reading { 1024, 12, 0 }, true, 19200, 19200, ring), { 12'000'000'000, -3072, 0 });
+
+            // An empty ring (all 4096 free): the pointer has caught up with the writes
+            expectTimestamp (getAlsaTimestamp (false, Reading { 4096, 12, 0 }, true, 19200, 19200, ring), { 12'000'000'000, 0, 0 });
+        }
+
+        beginTest ("The time is the reading's seconds and nanoseconds, exactly, from zero to large values");
+        {
+            expectTimestamp (getAlsaTimestamp (true, Reading { 0, 0, 0 }, true, 0, 0, ring), { 0, 0, 0 });
+            expectTimestamp (getAlsaTimestamp (true, Reading { 0, 9'000'000'000, 999'999'999 }, true, 0, 0, ring),
+                             { 9'000'000'000'999'999'999, 0, 0 });
+        }
+
+        beginTest ("Large frame counts keep exact offsets");
+        {
+            expectTimestamp (getAlsaTimestamp (true, Reading { 100, 1, 0 }, true, 1'099'511'627'776, 1'099'511'627'776, ring), { 1'000'000'000, 100, 0 });
+            expectTimestamp (getAlsaTimestamp (false, Reading { 96, 1, 0 }, true, 1'099'511'627'776, 1'099'511'627'776, ring), { 1'000'000'000, -4000, 0 });
+        }
+
+        beginTest ("No reading, another clock, or a count outside the ring gives nothing");
+        {
+            expectTimestamp (getAlsaTimestamp (true, Reading { 256, 1, 0 }, true, 9600, 9600, ring), { 1'000'000'000, 256, 0 });
+            expectAbsent (getAlsaTimestamp (true, std::nullopt, true, 9600, 9600, ring));
+            expectAbsent (getAlsaTimestamp (true, Reading { 256, 1, 0 }, false, 9600, 9600, ring));
+            expectAbsent (getAlsaTimestamp (true, Reading { 4097, 1, 0 }, true, 9600, 9600, ring));
+            expectAbsent (getAlsaTimestamp (false, Reading { 4097, 1, 0 }, true, 9600, 9600, ring));
+            expectAbsent (getAlsaTimestamp (false, Reading { -1, 1, 0 }, true, 9600, 9600, ring));
+        }
+    }
+
+private:
+    using Reading = AlsaPositionReading;
+
+    void expectTimestamp (const std::optional<AudioIODeviceTimestamp>& actual, const AudioIODeviceTimestamp& expected)
+    {
+        expect (actual.has_value() && isSameTimestamp (*actual, expected), "got " + describe (actual) + ", expected " + describe (expected));
+    }
+
+    void expectAbsent (const std::optional<AudioIODeviceTimestamp>& actual)
+    {
+        expect (! actual.has_value(), "got " + describe (actual) + ", expected absent");
+    }
+};
+
+static AlsaTimestampTests alsaTimestampTests;
+
 } // namespace juce::CallbackTimeHelpers

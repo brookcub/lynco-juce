@@ -5,7 +5,7 @@ name: timestamps-linux
 # device-timestamp roles. Triggered by pushes to this branch only.
 on:
   push:
-    branches: [ci/timestamps-combined, ci/timestamps-rails]
+    branches: [ci/timestamps-combined, ci/timestamps-rails, ci/timestamps-jack]
 
 jobs:
   linux:

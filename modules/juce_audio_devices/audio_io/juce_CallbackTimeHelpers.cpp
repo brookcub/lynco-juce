@@ -381,32 +381,7 @@ private:
 };
 
 //==============================================================================
-/*  The processing-cycle observation of an ASIO buffer switch: the current block's systemTime, at
-    offset 0. systemTime is the ASIOTimeStamp's two 32-bit halves (ns on the driver's clock), and
-    clockOffsetNs the offset from the driver's clock to the Time::getHighResolutionTicks() timeline,
-    identified and measured once when the device started, or nullopt if that was not established.
-    The time is systemTime + clockOffsetNs; no per-callback adjustment of any kind.
-
-    nullopt if systemTimeValid (kSystemTimeValid) is false or there is no clock offset.
-*/
-inline std::optional<AudioIODeviceTimestamp> getAsioProcessingCycle (bool systemTimeValid,
-                                                                     uint32_t systemTimeHi,
-                                                                     uint32_t systemTimeLo,
-                                                                     std::optional<int64_t> clockOffsetNs) noexcept
-{
-    if (! systemTimeValid || ! clockOffsetNs.has_value())
-        return {};
-
-    // The halves are unsigned: the low one must not be sign-extended on its way into the sum
-    const auto systemTimeNs = (int64_t) (((uint64_t) systemTimeHi << 32) | (uint64_t) systemTimeLo);
-
-    return AudioIODeviceTimestamp { systemTimeNs + *clockOffsetNs, 0, 0 };
-}
-
-/*  SPEC "ASIO: hardware findings and revision" (P021 revised). The getAsioProcessingCycle above is
-    superseded by the two seams below; P021's builder deletes it with the backend's old wiring.
-
-    One buffer switch's native pair: from the ASIOTime that bufferSwitchTimeInfo delivers for that
+/*  One buffer switch's native pair: from the ASIOTime that bufferSwitchTimeInfo delivers for that
     switch, or, for a driver that calls the plain bufferSwitch, from ASIOGetSamplePosition (its
     success sets both valid flags; it has no change flags).
 */
@@ -443,14 +418,33 @@ class AsioBlockTimes
 public:
     void reset (int blockSize) noexcept
     {
-        ignoreUnused (blockSize);    // P021 implements
+        size = blockSize;
+        start.reset();
     }
 
     std::optional<AudioIODeviceTimestamp> next (const AsioSwitchTime& switchTime, std::optional<int64_t> clockOffsetNs) noexcept
     {
-        ignoreUnused (switchTime, clockOffsetNs);
-        return {};    // P021 implements
+        const auto position = (int64_t) (((uint64_t) switchTime.samplePositionHi << 32) | (uint64_t) switchTime.samplePositionLo);
+
+        if (start.has_value())
+            *start += size;
+
+        if (switchTime.samplePositionValid && (! start.has_value() || position > *start))
+            start = position;
+
+        if (! switchTime.systemTimeValid || ! switchTime.samplePositionValid || ! clockOffsetNs.has_value())
+            return {};
+
+        // The halves are unsigned: the low one must not be sign-extended on its way into the sum
+        const auto systemTimeNs = (int64_t) (((uint64_t) switchTime.systemTimeHi << 32) | (uint64_t) switchTime.systemTimeLo);
+        const uint32_t flags = (switchTime.sampleRateChanged || switchTime.clockSourceChanged) ? (uint32_t) AudioIODeviceTimestamp::nativeDiscontinuity : 0u;
+
+        return AudioIODeviceTimestamp { systemTimeNs + *clockOffsetNs, position - *start, flags };
     }
+
+private:
+    int size = 0;
+    std::optional<int64_t> start;   // the current block's first frame, in the driver's count
 };
 
 /*  Three candidate clocks, read back to back at the instant timeGetTime()'s value changes, after
@@ -469,15 +463,32 @@ struct AsioClockCandidates
     driverTimesNs: successive system times of the run, oldest first. Needs at least 8. If every one
     is a whole millisecond the only candidate is timeGetTime; otherwise the candidates are QPC and
     interrupt time. A candidate c matches if the newest driver time t has c - maxAgeNs <= t <= c
-    (the driver's time is of a switch that has already happened, at most maxAgeNs earlier). Exactly
-    one candidate must match; none, or two (QPC and interrupt time closer together than maxAgeNs),
-    give nullopt.
+    (the driver's time is of a switch that has already happened, at most maxAgeNs earlier). If
+    none matches, nullopt. If QPC and interrupt time both match (they are closer together than
+    maxAgeNs), the clock is taken to be interrupt time; a driver that really uses QPC then has a
+    constant error of at most maxAgeNs.
 */
 inline std::optional<int64_t> identifyAsioClockOffset (const int64_t* driverTimesNs, int numDriverTimes,
                                                        const AsioClockCandidates& candidates, int64_t maxAgeNs) noexcept
 {
-    ignoreUnused (driverTimesNs, numDriverTimes, candidates, maxAgeNs);
-    return {};    // P021 implements
+    if (numDriverTimes < 8)
+        return {};
+
+    const auto newest = driverTimesNs[numDriverTimes - 1];
+    const auto allWholeMilliseconds = std::all_of (driverTimesNs, driverTimesNs + numDriverTimes,
+                                                   [] (int64_t t) { return t % 1'000'000 == 0; });
+
+    const auto matches = [&] (int64_t candidate) { return candidate - maxAgeNs <= newest && newest <= candidate; };
+
+    if (allWholeMilliseconds)
+        return matches (candidates.timeGetTimeNs) ? std::optional<int64_t> (candidates.qpcNs - candidates.timeGetTimeNs) : std::nullopt;
+
+    // Interrupt time first: if QPC matches as well (the two are closer than maxAgeNs), the driver's
+    // clock is taken to be interrupt time, and a QPC driver then has a constant error of the gap
+    if (matches (candidates.interruptTimeNs))
+        return candidates.qpcNs - candidates.interruptTimeNs;
+
+    return matches (candidates.qpcNs) ? std::optional<int64_t> (0) : std::nullopt;
 }
 
 //==============================================================================

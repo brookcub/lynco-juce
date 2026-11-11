@@ -564,7 +564,9 @@ public:
 
             JUCE_ASIO_LOG ("starting");
             calledback = false;
-            clockOffsetNs.reset();
+            clockOffsetKnown = false;
+            blockTimes.reset (currentBlockSizeSamples);
+            beginCollectingSystemTimes();
             err = asioObject->start();
 
             if (err != 0)
@@ -584,7 +586,7 @@ public:
 
                 // Once for this run, while the driver's callbacks are still being ignored
                 if (calledback)
-                    clockOffsetNs = measureClockOffset();
+                    identifyClockOffset();
 
                 isStarted = true;
 
@@ -623,6 +625,7 @@ public:
     {
         error.clear();
         stopTimer();
+        clockSourceChange.cancelPendingUpdate();
         stop();
 
         if (asioObject != nullptr && deviceIsOpen)
@@ -783,9 +786,37 @@ private:
     bool shouldUsePreferredSize = false;
     int xruns = 0;
 
-    // From the driver's clock to the Time::getHighResolutionTicks() timeline in ns: set once for
-    // each run by measureClockOffset(), before the first callback is delivered, and never changed
-    std::optional<int64_t> clockOffsetNs;
+    // From the driver's clock to the Time::getHighResolutionTicks() timeline in ns: identified and
+    // measured once for each run by identifyClockOffset(), and again only if the driver reports a
+    // change of clock source, when the processing cycle is absent until that has finished. The
+    // callback thread only reads it.
+    std::atomic<bool> clockOffsetKnown { false };
+    std::atomic<int64_t> clockOffsetValue { 0 };
+
+    // The driver's first eight system times of an identification, written by the callback thread
+    // while collecting, read by identifyClockOffset() once the count has reached eight
+    static constexpr int numTimesToIdentify = 8;
+    std::atomic<bool> collectingSystemTimes { false };
+    std::atomic<int> numSystemTimes { 0 };
+    int64_t systemTimes[numTimesToIdentify] {};
+    int64_t lastSystemTimeArrivedNs = 0;
+
+    CallbackTimeHelpers::AsioBlockTimes blockTimes;   // callback thread, under callbackLock
+
+    struct ClockSourceChange final : private AsyncUpdater
+    {
+        explicit ClockSourceChange (ASIOAudioIODevice& d) : device (d) {}
+        ~ClockSourceChange() override { cancelPendingUpdate(); }
+
+        using AsyncUpdater::triggerAsyncUpdate;
+        using AsyncUpdater::cancelPendingUpdate;
+
+        void handleAsyncUpdate() override  { device.identifyClockOffset(); }
+
+        ASIOAudioIODevice& device;
+    };
+
+    ClockSourceChange clockSourceChange { *this };
 
     //==============================================================================
     static String convertASIOString (char* text, int length)
@@ -1315,93 +1346,167 @@ private:
         return (ticks / perSecond) * 1'000'000'000 + (ticks % perSecond) * 1'000'000'000 / perSecond;
     }
 
-    /*  The driver's time for the current block: the systemTime that ASIOGetSamplePosition reports
-        from inside the buffer switch, at offset 0, on the timeline of Time::getHighResolutionTicks().
-        JUCE does not ask for ASIOTime, so this is how a driver is asked for the time. A driver that
-        reports an error has no valid time for this block.
+    // QueryInterruptTimePrecise in ns, or a time that no driver time can match if the system lacks it
+    static int64_t getInterruptTimeNs() noexcept
+    {
+        using Query = void (WINAPI*) (PULONGLONG);
+
+        static const auto query = []
+        {
+            for (auto* module : { "kernelbase.dll", "kernel32.dll" })
+                if (auto* f = (void*) GetProcAddress (GetModuleHandleA (module), "QueryInterruptTimePrecise"))
+                    return (Query) f;
+
+            return (Query) nullptr;
+        }();
+
+        ULONGLONG hundredNs = 0;
+
+        if (query == nullptr)
+            return std::numeric_limits<int64_t>::min() / 2;
+
+        query (&hundredNs);
+        return (int64_t) hundredNs * 100;
+    }
+
+    /*  The pair for a buffer switch whose driver does not deliver time info (it calls the plain
+        bufferSwitch): what ASIOGetSamplePosition reports from inside the switch. Back-to-back
+        switches can be handed the previous switch's pair; CallbackTimeHelpers::AsioBlockTimes dates those by their
+        position. A driver that reports an error has no valid pair for this switch.
     */
-    std::optional<AudioIODeviceTimestamp> getProcessingCycle() const
+    CallbackTimeHelpers::AsioSwitchTime readSwitchTime() const
     {
         ASIOSamples position {};
         ASIOTimeStamp systemTime {};
-        const auto err = asioObject->getSamplePosition (&position, &systemTime);
+        CallbackTimeHelpers::AsioSwitchTime result;
 
-        return CallbackTimeHelpers::getAsioProcessingCycle (err == ASE_OK, (uint32_t) systemTime.hi, (uint32_t) systemTime.lo, clockOffsetNs);
+        if (asioObject->getSamplePosition (&position, &systemTime) == ASE_OK)
+        {
+            result.systemTimeValid = result.samplePositionValid = true;
+            result.systemTimeHi = (uint32_t) systemTime.hi;
+            result.systemTimeLo = (uint32_t) systemTime.lo;
+            result.samplePositionHi = (uint32_t) position.hi;
+            result.samplePositionLo = (uint32_t) position.lo;
+        }
+
+        return result;
     }
 
-    /*  Works out, once for each run of the device, how the driver's systemTime relates to the
-        Time::getHighResolutionTicks() timeline: the offset to add to it, or nothing if that can't
-        be established. The offset is a constant of the run; no callback adjusts it.
-
-        The ASIO SDK defines systemTime on Windows as timeGetTime() * 1e6, but drivers differ, and
-        some report the QPC clock instead. They are told apart by their values: a timeGetTime clock
-        only ever reports whole milliseconds, which a clock in 100 ns units does about once in ten
-        thousand readings, so eight readings that are all whole milliseconds are a timeGetTime clock.
-
-        A QPC clock is the same clock as the timeline, so its offset is zero. For a timeGetTime
-        clock the offset is the difference between the two clocks at one instant, taken as exactly
-        as the tick allows: the QPC time at the moment timeGetTime's value changes.
-
-        If the clock can't be identified (too few readings, or no tick change to catch), the
-        processing cycle is absent for the whole run. Once it is identified, no reading is compared
-        with the callback's arrival, and none is dropped or adjusted.
-    */
-    std::optional<int64_t> measureClockOffset()
+    // The pair that bufferSwitchTimeInfo delivers for its switch, with the driver's own flags
+    static CallbackTimeHelpers::AsioSwitchTime toSwitchTime (const ASIOTime& time)
     {
-        constexpr int numReadingsNeeded = 8;
-        struct Reading { int64_t systemTimeNs; };
-        Reading readings[numReadingsNeeded] {};
-        int numReadings = 0;
-        const auto giveUpAt = Time::getMillisecondCounter() + 2000;
+        const auto& info = time.timeInfo;
+        CallbackTimeHelpers::AsioSwitchTime result;
 
-        // Each reading is a new buffer switch, so these take eight buffers
-        while (numReadings < numReadingsNeeded && Time::getMillisecondCounter() < giveUpAt)
-        {
-            ASIOSamples position {};
-            ASIOTimeStamp systemTime {};
-            const auto err = asioObject->getSamplePosition (&position, &systemTime);
-            const auto systemTimeNs = (int64_t) (((uint64_t) (uint32_t) systemTime.hi << 32) | (uint32_t) systemTime.lo);
-
-            if (err == ASE_OK && (numReadings == 0 || systemTimeNs != readings[numReadings - 1].systemTimeNs))
-                readings[numReadings++] = { systemTimeNs };
-
-            Thread::sleep (1);
-        }
-
-        if (numReadings < numReadingsNeeded)
-            return {};
-
-        int64_t offset = 0;
-
-        if (std::all_of (std::begin (readings), std::end (readings),
-                         [] (const Reading& r) { return r.systemTimeNs % 1'000'000 == 0; }))
-        {
-            const auto firstTick = timeGetTime();
-            DWORD tick = firstTick;
-            int64_t atTickNs = 0;
-
-            // Spin to the instant the tick changes (as long as it takes, which is under a timer period)
-            for (auto limit = Time::getMillisecondCounter() + 100; tick == firstTick && Time::getMillisecondCounter() < limit;)
-            {
-                atTickNs = getHighResolutionNs();
-                tick = timeGetTime();
-            }
-
-            if (tick == firstTick)
-                return {};
-
-            offset = atTickNs - (int64_t) tick * 1'000'000;
-        }
-
-        return offset;
+        result.systemTimeValid     = (info.flags & kSystemTimeValid) != 0;
+        result.samplePositionValid = (info.flags & kSamplePositionValid) != 0;
+        result.systemTimeHi        = (uint32_t) info.systemTime.hi;
+        result.systemTimeLo        = (uint32_t) info.systemTime.lo;
+        result.samplePositionHi    = (uint32_t) info.samplePosition.hi;
+        result.samplePositionLo    = (uint32_t) info.samplePosition.lo;
+        result.sampleRateChanged   = (info.flags & kSampleRateChanged) != 0;
+        result.clockSourceChanged  = (info.flags & kClockSourceChanged) != 0;
+        return result;
     }
 
     //==============================================================================
-    void JUCE_ASIOCALLBACK callback (long index)
+    void beginCollectingSystemTimes() noexcept
     {
+        numSystemTimes = 0;
+        collectingSystemTimes = true;
+    }
+
+    // Callback thread (the driver's callbacks are one at a time): the first eight valid system
+    // times after beginCollectingSystemTimes(), and when the last of them arrived
+    void collectSystemTime (const CallbackTimeHelpers::AsioSwitchTime& switchTime) noexcept
+    {
+        const auto index = numSystemTimes.load();
+
+        if (collectingSystemTimes && switchTime.systemTimeValid && index < numTimesToIdentify)
+        {
+            systemTimes[index] = (int64_t) (((uint64_t) switchTime.systemTimeHi << 32) | (uint64_t) switchTime.systemTimeLo);
+            lastSystemTimeArrivedNs = getHighResolutionNs();
+            numSystemTimes.store (index + 1);
+        }
+    }
+
+    /*  Works out, once for each run of the device, how the driver's systemTime relates to the
+        Time::getHighResolutionTicks() timeline, and stores the offset to add to it, or leaves the
+        processing cycle absent if that can't be established. The offset is a constant of the run;
+        no callback adjusts it.
+
+        The ASIO SDK defines systemTime on Windows as timeGetTime() * 1e6, but drivers differ: some
+        report the QPC clock, some the interrupt-time clock (100 ns units, which on a PC that has
+        slept is far from QPC). The driver's first eight system times are compared with the three
+        clocks read back to back at an instant when timeGetTime's value changes, as exactly as the
+        tick allows; CallbackTimeHelpers::identifyAsioClockOffset() picks the one clock they match and gives its offset
+        to QPC. Once it is identified, no reading is compared with the callback's arrival, and none
+        is dropped or adjusted.
+
+        Not for the callback thread: it waits for eight buffer switches and for a timer tick.
+    */
+    void identifyClockOffset()
+    {
+        clockOffsetKnown = false;
+        beginCollectingSystemTimes();
+
+        for (auto giveUpAt = Time::getMillisecondCounter() + 2000;
+             numSystemTimes < numTimesToIdentify && Time::getMillisecondCounter() < giveUpAt;)
+            Thread::sleep (1);
+
+        collectingSystemTimes = false;
+
+        if (numSystemTimes < numTimesToIdentify)
+            return;
+
+        // A switch that follows another at once (a driver catching up) can be given a time up to a
+        // block ahead of its arrival, so the clocks are read at least a block (and a margin) later
+        const auto blockNs = (int64_t) (currentBlockSizeSamples / currentSampleRate * 1e9);
+
+        while (getHighResolutionNs() < lastSystemTimeArrivedNs + blockNs + 1'000'000)
+            Thread::yield();
+
+        const auto firstTick = timeGetTime();
+        auto tick = firstTick;
+        CallbackTimeHelpers::AsioClockCandidates candidates {};
+
+        // Spin to the instant the tick changes (as long as it takes, which is under a timer period)
+        for (auto limit = Time::getMillisecondCounter() + 100; tick == firstTick && Time::getMillisecondCounter() < limit;)
+        {
+            candidates = { getHighResolutionNs(), getInterruptTimeNs(), 0 };
+            tick = timeGetTime();
+        }
+
+        if (tick == firstTick)
+            return;
+
+        candidates.timeGetTimeNs = (int64_t) tick * 1'000'000;
+
+        // A block's age, the wait above, a timer tick of spinning to the edge, and the interrupt clock's lag of up to a tick
+        const auto maxAgeNs = 2 * blockNs + 32'000'000;
+
+        if (const auto offset = CallbackTimeHelpers::identifyAsioClockOffset (systemTimes, numTimesToIdentify, candidates, maxAgeNs))
+        {
+            clockOffsetValue = *offset;
+            clockOffsetKnown = true;
+        }
+    }
+
+    //==============================================================================
+    void JUCE_ASIOCALLBACK callback (long index, const CallbackTimeHelpers::AsioSwitchTime& switchTime)
+    {
+        collectSystemTime (switchTime);
+
+        if (switchTime.clockSourceChanged)
+        {
+            // The offset belongs to the old clock: absent until the new one is identified, off this thread
+            clockOffsetKnown = false;
+            clockSourceChange.triggerAsyncUpdate();
+        }
+
         if (isStarted)
         {
-            processBuffer (index);
+            processBuffer (index, switchTime);
         }
         else
         {
@@ -1412,9 +1517,13 @@ private:
         calledback = true;
     }
 
-    void processBuffer (long bufferIndex)
+    void processBuffer (long bufferIndex, const CallbackTimeHelpers::AsioSwitchTime& switchTime)
     {
         const ScopedLock sl (callbackLock);
+
+        // Every switch counts, so the block starts stay in step even when no callback is attached
+        const auto offset = clockOffsetKnown ? std::optional<int64_t> (clockOffsetValue.load()) : std::nullopt;
+        const auto cycle = blockTimes.next (switchTime, offset);
 
         if (bufferIndex >= 0)
         {
@@ -1430,7 +1539,6 @@ private:
                 }
 
                 // hostTimeNs stays empty, as in stock JUCE; the processing cycle is the driver's own time of this block
-                const auto cycle = getProcessingCycle();
                 const AudioIODeviceCallbackContext context { nullptr, nullptr, nullptr, cycle.has_value() ? &*cycle : nullptr };
 
                 currentCallback->audioDeviceIOCallbackWithContext (inBuffers.getData(),
@@ -1473,7 +1581,7 @@ private:
             case kAsioLatenciesChanged:  JUCE_ASIO_LOG ("kAsioLatenciesChanged"); return 1;
             case kAsioEngineVersion:     return 2;
 
-            case kAsioSupportsTimeInfo:
+            case kAsioSupportsTimeInfo:  return 1;   // the driver then delivers each switch's own time with it
             case kAsioSupportsTimeCode:  return 0;
             case kAsioOverload:          ++xruns; return 1;
         }
@@ -1485,10 +1593,10 @@ private:
     template <int deviceIndex>
     struct ASIOCallbackFunctions
     {
-        static ASIOTime* JUCE_ASIOCALLBACK bufferSwitchTimeInfoCallback (ASIOTime*, long index, long)
+        static ASIOTime* JUCE_ASIOCALLBACK bufferSwitchTimeInfoCallback (ASIOTime* time, long index, long)
         {
             if (auto* d = currentASIODev[deviceIndex])
-                d->callback (index);
+                d->callback (index, time != nullptr ? toSwitchTime (*time) : CallbackTimeHelpers::AsioSwitchTime());
 
             return {};
         }
@@ -1496,7 +1604,7 @@ private:
         static void JUCE_ASIOCALLBACK bufferSwitchCallback (long index, long)
         {
             if (auto* d = currentASIODev[deviceIndex])
-                d->callback (index);
+                d->callback (index, d->readSwitchTime());
         }
 
         static long JUCE_ASIOCALLBACK asioMessagesCallback (long selector, long value, void*, double*)

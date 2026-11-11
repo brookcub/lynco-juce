@@ -409,4 +409,60 @@ private:
 
 static CoreAudioChunkTimestampTests coreAudioChunkTimestampTests;
 
+//==============================================================================
+/*  Acceptance tests for P021 (ASIO processing-cycle time). The driver time and clock offset are
+    fakes; expected times are their sums, worked by hand. Whether the offset is right for a given
+    driver is a hardware check (RAILS.md), not a unit test.
+*/
+class AsioProcessingCycleTests final : public UnitTest
+{
+public:
+    AsioProcessingCycleTests() : UnitTest ("ASIO processing cycle timestamps", UnitTestCategories::audio) {}
+
+    void runTest() override
+    {
+        beginTest ("The block's system time plus the run's clock offset, at offset 0");
+        {
+            expectTimestamp (getAsioProcessingCycle (true, 0, 1'000'000'000, 5'000), { 1'000'005'000, 0, 0 });
+            expectTimestamp (getAsioProcessingCycle (true, 0, 1'000'000'000, -1'000'000'000), { 0, 0, 0 });
+        }
+
+        beginTest ("Both halves of the system time count, the low half as unsigned");
+        {
+            // hi = 2, lo = 0x80000000: 2 * 2^32 + 2^31 = 10,737,418,240 ns
+            expectTimestamp (getAsioProcessingCycle (true, 2, 0x80000000u, 0), { 10'737'418'240, 0, 0 });
+            // hi = 0x00010000, lo = 0xffffffff: 2^48 + 2^32 - 1 = 281,479,271,677,951 ns
+            expectTimestamp (getAsioProcessingCycle (true, 0x00010000u, 0xffffffffu, 0), { 281'479'271'677'951, 0, 0 });
+        }
+
+        beginTest ("The same offset gives every block of a run the driver's own spacing");
+        {
+            const auto a = getAsioProcessingCycle (true, 1, 100, 123'456'789);
+            const auto b = getAsioProcessingCycle (true, 1, 100 + 10'000'000, 123'456'789);
+            expect (a.has_value() && b.has_value() && b->timeNs - a->timeNs == 10'000'000);
+            expectTimestamp (a, { 4'294'967'296 + 100 + 123'456'789, 0, 0 });
+        }
+
+        beginTest ("No valid system time, or no established clock offset, gives nothing");
+        {
+            expectTimestamp (getAsioProcessingCycle (true, 0, 1'000, 0), { 1'000, 0, 0 });
+            expectAbsent (getAsioProcessingCycle (false, 0, 1'000, 0));
+            expectAbsent (getAsioProcessingCycle (true, 0, 1'000, std::nullopt));
+        }
+    }
+
+private:
+    void expectTimestamp (const std::optional<AudioIODeviceTimestamp>& actual, const AudioIODeviceTimestamp& expected)
+    {
+        expect (actual.has_value() && isSameTimestamp (*actual, expected), "got " + describe (actual) + ", expected " + describe (expected));
+    }
+
+    void expectAbsent (const std::optional<AudioIODeviceTimestamp>& actual)
+    {
+        expect (! actual.has_value(), "got " + describe (actual) + ", expected absent");
+    }
+};
+
+static AsioProcessingCycleTests asioProcessingCycleTests;
+
 } // namespace juce::CallbackTimeHelpers

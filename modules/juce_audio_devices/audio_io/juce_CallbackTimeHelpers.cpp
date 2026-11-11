@@ -185,4 +185,23 @@ inline AudioIODeviceCallbackContext getCombinedCallbackContext ([[maybe_unused]]
     return {};
 }
 
+//==============================================================================
+/*  The processing-cycle observation of an ASIO buffer switch: the current block's systemTime, at
+    offset 0. systemTime is the ASIOTimeStamp's two 32-bit halves (ns on the driver's clock), and
+    clockOffsetNs the offset from the driver's clock to the Time::getHighResolutionTicks() timeline,
+    identified and measured once when the device started, or nullopt if that was not established.
+    The time is systemTime + clockOffsetNs; no per-callback adjustment of any kind.
+
+    nullopt if systemTimeValid (kSystemTimeValid) is false or there is no clock offset.
+
+    Stub: the patch that implements it is P021.
+*/
+inline std::optional<AudioIODeviceTimestamp> getAsioProcessingCycle ([[maybe_unused]] bool systemTimeValid,
+                                                                     [[maybe_unused]] uint32_t systemTimeHi,
+                                                                     [[maybe_unused]] uint32_t systemTimeLo,
+                                                                     [[maybe_unused]] std::optional<int64_t> clockOffsetNs) noexcept
+{
+    return {};
+}
+
 } // namespace juce::CallbackTimeHelpers

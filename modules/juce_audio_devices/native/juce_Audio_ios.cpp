@@ -1121,12 +1121,21 @@ struct iOSAudioIODevice::Pimpl final : public AsyncUpdater
 
             const auto nanos = time != nullptr ? timeConversions.hostTimeToNanos (time->mHostTime) : 0;
 
+            // The render stamp names the start of this cycle's buffer: forwarded as the processing
+            // cycle, with no claim about when the input was captured or the output will be heard
+            const auto cycle = CallbackTimeHelpers::getBufferStartTimestamp (time,
+                                                                             kAudioTimeStampHostTimeValid,
+                                                                             [this] (uint64_t hostTime) { return timeConversions.hostTimeToNanos (hostTime); });
+
             callback->audioDeviceIOCallbackWithContext ((const float**) inputData,
                                                         channelData.inputs ->numActiveChannels,
                                                         outputData,
                                                         channelData.outputs->numActiveChannels,
                                                         (int) numFrames,
-                                                        { (time != nullptr && (time->mFlags & kAudioTimeStampHostTimeValid) != 0) ? &nanos : nullptr });
+                                                        { (time != nullptr && (time->mFlags & kAudioTimeStampHostTimeValid) != 0) ? &nanos : nullptr,
+                                                          nullptr,
+                                                          nullptr,
+                                                          cycle.has_value() ? &*cycle : nullptr });
 
             for (int c = 0; c < channelData.outputs->numActiveChannels; ++c)
             {

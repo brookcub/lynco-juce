@@ -97,8 +97,8 @@ jobs:
           fi
           # The mutant must fail every run, on the absolute check alone
           for run in 1 2 3; do
-            grep '^FAIL' run$run.log || true
-            test "$(grep -c '^FAIL' run$run.log)" -eq 1
+            grep '^FAIL  ' run$run.log || true
+            test "$(grep -c '^FAIL  ' run$run.log)" -eq 1    # FAIL lines, not the FAILURES summary
             grep -q '^FAIL  outputStream predicts each marker' run$run.log
           done
           echo "MUTANT KILLED in every run"

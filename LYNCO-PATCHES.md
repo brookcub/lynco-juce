@@ -11,7 +11,7 @@ Brooklyn (2026-10-19):
 
 > "never mix our changes into juce, keep them visible and separable, and do not build individual product policy/configuration into the juce changes because all lynco apps must share the same juce version with the same patches."
 
-Each patch is one commit, subject `LynCo: <purpose>`, trailer `LynCo-Patch: Pnnn`.
+Each patch is one commit, subject `LynCo: <purpose>`, trailer `LynCo-Patch: Pnnn` (`Pnnn.n` for a revision, see "Revising a patch").
 
 This file describes the JUCE problem each patch addresses and what it changes. It does not say which app needed a patch; each app records that in its own decision log.
 
@@ -21,6 +21,10 @@ This file describes the JUCE problem each patch addresses and what it changes. I
 2. Drop a patch if upstream has fixed the problem it addresses.
 3. Rebuild and retest every LynCo app against the branch.
 4. Tag the result `lynco-<juce>.<n>`. Tags are never moved; a fix gets a new tag.
+
+### Revising a patch
+
+A patch number names the patch's purpose. When a published patch's purpose stays but its implementation is replaced, the replacement takes the next revision number: P009 becomes P009.1, then P009.2. It takes the original's place in the series, with trailer `LynCo-Patch: P009.1`; the earlier revision stays only in the tags that shipped it. The ledger keeps one section per purpose, describing the current revision, followed by one history line per earlier revision: `P009 (lynco-8.0.12.2 to .5): <what it did>. Replaced by P009.1 in .6: <why>.` A patch whose purpose is dropped is marked retired, with no successor. Numbers are never reused. A patch that has not been published is revised in its PR and keeps its number.
 
 ### Moving an app's pin
 
@@ -103,7 +107,7 @@ An app that defines a macro does so at its own build boundary (for example `targ
      ./gradlew --no-daemon -Pandroid.injected.build.abi=x86_64 assembleDebug_Debug
      ```
      APK: `app/build/intermediates/apk/debug_/debug/app-debug_-debug.apk`. Copy it aside as `with-P006.apk`.
-  4. Build without P006: `git checkout <P006>^ -- modules/juce_gui_basics/native/juce_Windowing_android.cpp` (`<P006>` is the commit with trailer `LynCo-Patch: P006`), rebuild as in step 3, copy the APK aside as `without-P006.apk`, then `git checkout HEAD -- modules/juce_gui_basics/native/juce_Windowing_android.cpp`.
+  4. Build without P006: `git show <P006> | git apply -R` (`<P006>` is the commit with trailer `LynCo-Patch: P006`; reverting only its diff keeps later patches to the same file), rebuild as in step 3, copy the APK aside as `without-P006.apk`, then `git checkout HEAD -- modules/juce_gui_basics/native/juce_Windowing_android.cpp`.
   5. Run each APK, repeating step 2 first:
      ```
      adb -s 127.0.0.1:5721 shell wm size 1600x2560; adb -s 127.0.0.1:5721 shell wm density 320
@@ -115,48 +119,66 @@ An app that defines a macro does so at its own build boundary (for example `targ
      adb -s 127.0.0.1:5721 exec-out screencap -p > shot.png
      ```
   6. Expected, 3 of 3 runs each: without P006 the process is gone (`pidof` prints nothing) and the log has two `Throwing OutOfMemoryError "Failed to allocate a 16384012 byte allocation ... growth limit 16777216"` lines, then `JNI DETECTED ERROR IN APPLICATION: JNI GetIntArrayElements called with pending exception java.lang.OutOfMemoryError` in `AndroidComponentPeer::handlePaintCallback`, then `Fatal signal 6 (SIGABRT)`. With P006 the same two OutOfMemoryError warnings appear, there is no JNI error or abort, `pidof` prints a pid, and the screenshot shows the painted DemoRunner start screen.
+  7. The same run with a LynCo app's Debug x86_64 build at `lynco-8.0.12.4`, 2026-10-24, 3 runs each: without P006 the app aborts the same way in 3 of 3; with it the app stays alive in 3 of 3 and paints its full screen. Not exercised: the skipped frame when not even one row fits.
 
-### P007: Callback context carries the input sample time
+### P007.1: Callback context carries native device timestamps by role
 
-- **Files:** `modules/juce_audio_devices/audio_io/juce_AudioIODevice.h`
-- **Changes:** adds `AudioIODeviceCallbackContext::inputHostTimeNs` (`const uint64_t*`, default `nullptr`) and documents what both time fields mean. `hostTimeNs` is the time of the first output sample of the callback, or of the first input sample when there is no output, and null when that cannot be established even if there are outputs. `inputHostTimeNs` is the time of the first input sample actually captured into the callback, and null when the device gives none or the first sample was not captured (for example padding). Both are nanoseconds on the timeline of `Time::getHighResolutionTicks()`, are the times the OS or driver reports with no latency or bias correction, and converting a device's position and time pair to the callback's first sample is part of the contract while guessing a latency is not.
-- **Why:** the context had one time with a vague comment, and a device with inputs and outputs has two different first samples: the input was captured before the output will be heard.
-- **Default behaviour:** nothing fills the new field yet, so there is no behaviour change; every existing backend leaves it null. Declaration and documentation only, every platform.
-- **Test evidence:** the aggregate initialisation in `juce_CoreAudio_mac.cpp` names only the first member and is unaffected; every other user of the struct only receives or forwards it. `UnitTestRunner` builds on Windows with the change (Release, MSVC), and `UnitTestRunner --category=Audio` passes.
+- **Files:** `modules/juce_audio_devices/audio_io/juce_AudioIODevice.h`, `modules/juce_audio_devices/audio_io/juce_CallbackTimeHelpers.cpp` and `juce_CallbackTimeHelpers_test.cpp` (new), `modules/juce_audio_devices/juce_audio_devices.cpp` (their includes).
+- **Changes:** adds `AudioIODeviceTimestamp { timeNs, sampleOffset, nativeFlags }` and three pointers to it in `AudioIODeviceCallbackContext`, one per role: `inputStream` (a time at the source's capture or input pipeline reference point), `outputStream` (at its playback or presentation reference point, an observed position or a native prediction per source) and `processingCycle` (the native time of the processing cycle, with no capture or presentation claim). P007's `inputHostTimeNs` is removed; `hostTimeNs` keeps upstream's comment and meaning.
+  - **Absence:** `nullptr` is the only absence marker; zero is a valid time. A native value that the source marks invalid without a payload is absent; one delivered with a native error or degraded flag is delivered with `nativeFlags` set (`nativeDiscontinuity`, `nativeTimestampError`, `nativeReducedAccuracy`).
+  - **Clock:** `timeNs` is in ns on the clock and origin of `Time::getHighResolutionTicks()` (QPC on Windows, `mach_absolute_time` on Apple, `CLOCK_MONOTONIC` on Android and Linux), converted from the native value by an exact unit conversion. The header names the only exceptions: ASIO's clock-origin offset, measured once per run (P021); JACK's per-callback `CLOCK_MONOTONIC - CLOCK_MONOTONIC_RAW` difference (P023); and WASAPI's 100 ns units, which carry up to 100 ns of the OS's own rounding when QPC is not 10 MHz (P009.1). No latency, smoothing or rate correction.
+  - **Offset:** `sampleOffset` is the timestamped sample's position minus that of the buffer's first sample, in frames: negative before the buffer, positive after its start (for example a real sample after leading padding). Padding is never timestamped.
+  - **One adjustment:** when sample-rate conversion puts the native position x between two application samples, the position becomes the nearest sample, n = floor (x + 1/2) (a half-sample residual rounds up), and the time moves by (n - x) samples at the application rate, at most half a period, applied once.
+  - **Run:** `audioDeviceAboutToStart` and `audioDeviceStopped` delimit the run a role's sample positions belong to; no observation crosses a stop.
+  - **Source table:** the context's comment has a table of each backend's native source per role, with observation or prediction. Each backend's patch adds its own row (P009.1, P013.1, P014.1, P020 to P023); until then a backend is under "all others", every role absent.
+  - **Helpers:** `CallbackTimeHelpers::alignToApplicationSample` implements the one adjustment in exact integer arithmetic (the position is split into whole multiples of the denominator and a remainder, so no intermediate reaches 2^63, and no 128-bit type is needed), and `forChunkAt` gives an observation as seen from a chunk of its buffer (time and flags unchanged, offset minus the chunk's start). Each backend's patch adds its own helpers and tests to the same two files, one section per patch.
+- **Why:** P007's single time per direction was defined at the callback's first sample, so every backend had to project a native (position, time) pair to that sample with a nominal rate, and a duplex callback's input, output and cycle times were mixed in two fields. A consumer that relates the device clock to its buffers needs the native observation itself and the sample it belongs to.
+- **Default behaviour:** every platform. Code that reads `hostTimeNs`, or initialises the context with it alone, is unaffected; code that used `inputHostTimeNs` moves to `inputStream`. Every role is absent until a backend's patch fills it.
+- **Rails:** the acceptance tests of P007.1 to P023 were written from the contract by a rails author before the code, blind to it, and the builders did not edit them. Every expected value is a hand-worked integer or exact fraction (checked with Python's `fractions.Fraction`); no test calls production code to compute an expectation, and a sweep checks the defining relation on exact integers instead of a copy of the formula. Each rule was checked against a throwaway reference and mutants of it. For P007.1's alignment, red cases across the suites: a floor instead of the nearest sample 5, ties rounded down 3, truncation toward zero with a 64-bit product 8, double arithmetic 1 (large counters). The half-nanosecond tie of the final ns rounding is not pinned. Integration harnesses (macOS combined device, Linux ALSA and JACK) ran on CI branches outside this series. "SPEC", "REQUIREMENTS" and data paths such as `hw-windows/` in the sections below refer to the contract, decisions and measurements kept in the LynCo SDK review workspace (`_review/timestamps-v2`); the fork has no decision log of its own.
+- **Test evidence:** `UnitTestRunner` built out of tree with `cmake -S <JUCE> -B <build> -DJUCE_BUILD_EXTRAS=ON`, then `cmake --build <build> --target UnitTestRunner --config Release`, run as `UnitTestRunner --category=Audio`, Windows 11, MSVC (Visual Studio 18), on the whole .6 series: `Callback timestamp alignment` 9 of 9, whole run 288 of 288, exit 0.
 
-### P008: Split callbacks get advanced times
+P007 (lynco-8.0.12.2 to .5): Added `inputHostTimeNs` and defined it and `hostTimeNs` as the times of the callback's first input and output samples, projected from the device's position and time pairs. Replaced by P007.1 in .6: a projection to the first sample needs a nominal rate and mixes roles; the context now carries each role's native observation with its sample offset, and `hostTimeNs` is upstream's again.
 
-- **Files:** `modules/juce_audio_devices/audio_io/juce_AudioDeviceManager.cpp`
-- **Changes:** `CallbackMaxSizeEnforcer`, which splits a device callback longer than the device's buffer size into blocks, keeps the device's sample rate from `audioDeviceAboutToStart` and, for every block after the first, passes a context whose non-null `hostTimeNs` and `inputHostTimeNs` are the original value plus `position * 1e9 / sampleRate` rounded to the nearest nanosecond. A null time stays null; the first block gets the original pointers. The values live in locals of the callback, so nothing is allocated. The `AudioDeviceManager` unit tests gain four cases and the mock device offers a buffer size of 512 and can make a callback.
-- **Why:** the same context was passed to every block, so the second and later blocks carried the time of the first block's first sample.
-- **Default behaviour:** unchanged whenever a callback is not split (one block, the original pointers). Every platform that delivers `hostTimeNs`, or `inputHostTimeNs` from P007.
-- **Test evidence:** `UnitTestRunner` built out of tree with `cmake -S <JUCE> -B <build> -DJUCE_BUILD_EXTRAS=ON`, then `cmake --build <build> --target UnitTestRunner --config Release`, run as `UnitTestRunner --category=Audio`. Tested 2026-10-23, Windows 11, MSVC (Visual Studio 18).
-  1. With this patch: exit code 0, `All tests completed successfully`, 205 `Completed tests` lines, no `!!!` lines.
-  2. With only the `blockContext` argument in `CallbackMaxSizeEnforcer` changed back to `context` (the tests kept): exit code 1; the two-block times case fails 2 checks, the one-time-null case 2 checks and the rounding case 4 checks. The case with both times null passes on the old code too, because it guards that the fix does not invent a time.
+### P008.1: Split callbacks stay correctly associated
 
-### P009: WASAPI callbacks carry device times
+**Files:** `modules/juce_audio_devices/audio_io/juce_AudioDeviceManager.cpp` (`CallbackMaxSizeEnforcer` and the `AudioDeviceManager` tests). Uses `CallbackTimeHelpers::forChunkAt` from `audio_io/juce_CallbackTimeHelpers.cpp` (P007.1).
 
-- **Files:** `modules/juce_audio_devices/native/juce_WASAPI_windows.cpp`
-- **Changes:** fills `hostTimeNs` and `inputHostTimeNs` (P007) in the WASAPI backend, in ns on the QPC timeline.
-  - **Input:** `GetBuffer` is asked for the QPC time of each packet's first frame. A small helper, `InputTimeline`, keeps the end time of the newest queued packet and how many of the newest queued frames are timed with no gap between them. A callback's input time is that end time minus the frames queued, which is the time of the oldest queued frame. It is null when the callback starts with padding, or when any queued frame is from a packet flagged `AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR` or queued before one flagged `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY`, until those frames have been taken.
-  - **Output:** the device gets `IAudioClock` from the client, counts every frame it releases to the render client (start-up silence included), and before each callback reads `GetPosition` and converts it with `GetFrequency` (not necessarily frames). The time of the callback's first output frame is the clock's QPC time plus (frames released minus position in frames) at the sample rate. It is null if there is no clock or `GetPosition` fails or returns `S_FALSE`.
-  - **Run loop:** `hostTimeNs` is the output time when the callback has output channels and the input time otherwise; `inputHostTimeNs` is the input time. Both live in locals of the loop; nothing is allocated or locked.
-- **Why:** the callback context had no times on Windows. Callback entry on WASAPI has 0.4 to 4.7 ms of jitter, against 0.25 to 0.3 ms for the device's packet time.
-- **Default behaviour:** an app that ignores the two fields is unaffected. The only other change in the callback path is one `GetPosition` call per callback with an output and a count of released frames.
-- **Test evidence:** `UnitTestRunner` built out of tree with `cmake -S <JUCE> -B <build> -DJUCE_BUILD_EXTRAS=ON`, then `cmake --build <build> --target UnitTestRunner --config Release`, run as `UnitTestRunner --category=Audio`. Tested 2026-10-23, Windows 11, MSVC (Visual Studio 18).
-  1. With this patch: exit code 0, `All tests completed successfully`, 219 `Completed tests` lines (205 before, plus 14 `WASAPI timestamps` cases), no `!!!` lines.
-  2. Each of these changes to the helper, with the tests kept, gives exit code 1:
-     - the newest packet's first-frame time instead of the oldest queued frame's: 6 checks fail in 5 cases (left-over frames, two packets, three packets, queue wraparound, discontinuity);
-     - the discontinuity flag ignored: 2 checks fail in the discontinuity case;
-     - the timestamp-error flag ignored: 4 checks fail in 2 cases;
-     - a callback that starts with padding given a time anyway: 2 checks fail in the padding case;
-     - the clock position treated as frames instead of converted with the frequency: 5 checks fail in the 3 output cases with a clock position.
-  3. Hardware: Focusrite Scarlett on this PC with output 1 cabled to input 1, 48 kHz, a -30 dBFS click about every 0.3 s, 40 s per run, against the lab app built on this tree (`_review/arrival-timestamps`, `tslab` with `-DLAB_P009=ON`). Six clean runs of WASAPI shared 480 and 192 and low-latency 480, with 1 to 9 xruns each, one of them with 0 to 4 ms holds in 9 % of callbacks:
-     - `hostTimeNs` was present in 100.00 % of callbacks in every run, and `inputHostTimeNs` in 99.3 to 99.95 % (100.00 % after the first 5 s in four of the six), null only at start-up and for 1 to 4 callbacks after each xrun while the callbacks before the discontinuity drained;
-     - input jitter (std) 218 to 349 µs, output jitter 255 to 449 µs, native loop L 184.3 to 185.2 ms with robust σ 0.39 to 0.58 ms and no click more than 2 ms off, against 251 to 300 µs, 0.38 to 0.54 ms and 180 to 191 ms for the lab's WASAPI rows (same session, lab fork: 258 and 341 µs input jitter, L 184.5 and 184.3 ms, σ 0.43 and 0.30 ms);
-     - in the run with the holds, callback entry minus input time and output time minus callback entry were the same for held and unheld callbacks (51.56 against 51.46 ms, and 60.60 against 60.60 ms), and input jitter was 247 µs against 218 and 335 µs undelayed;
-     - two runs (shared 480 and low-latency 480) had 382 and 569 xruns over the run, cause not established (the machine was shared with other builds); there `inputHostTimeNs` was present in 71.6 % and 57.5 % of callbacks, `hostTimeNs` still in 100 %, and the loop was still 184.1 to 184.4 ms. The same low-latency run repeated, with the lab fork and this one alternating, gave 2 and 1 xruns for the lab and 9 and 2 for this patch.
-  4. Not checked: WASAPI exclusive input (the Scarlett refuses to open it). Exclusive output alone opened and gave `hostTimeNs` in 100 % of 1501 callbacks at 16.9 ms ahead of callback entry, but its accuracy was not measured.
+**Why:** `CallbackMaxSizeEnforcer` splits a device callback into blocks no longer than the device's buffer size. A native timestamp names a moment and a sample position relative to the callback's buffer; for a block that starts k samples into that buffer, the same moment is k samples earlier relative to the block. The enforcer therefore keeps each timestamp's time and moves only its offset, which needs no sample rate and no arithmetic on times.
+
+**Contract:** For a block starting at sample k, each present role (`inputStream`, `outputStream`, `processingCycle`) is passed with the same `timeNs`, the same `nativeFlags` and `sampleOffset - k`. An absent role stays `nullptr`. `hostTimeNs` is passed to every block unchanged, exactly as stock JUCE 8.0.12's enforcer does. Per-block copies live on the audio thread's stack: no allocation, no locks. The enforcer no longer stores the device's sample rate.
+
+**Verification:** Windows `UnitTestRunner --category=Audio` (Release), whole .6 series: `AudioDeviceManager` (16 cases, 5 of them the enforcer's, driven through the mock device) and `Callback timestamp alignment` (9 cases) pass; whole run 288 of 288. Upstream's enforcer (the context passed unchanged) fails 4 of the 5 enforcer cases, on the role offsets only; P008's fails on `hostTimeNs` as well.
+
+P008 (lynco-8.0.12.2 to .5): Advanced the callback context's host time and the input host time by each block's duration when `CallbackMaxSizeEnforcer` split a callback. Replaced by P008.1 in .6: the callback context now carries native device timestamps whose time stays fixed and whose sample offset moves with the block, and `hostTimeNs` returns to stock behaviour, so no time is advanced by a computed duration.
+
+### P009.1: WASAPI forwards device timestamps
+
+**Files:** `modules/juce_audio_devices/native/juce_WASAPI_windows.cpp` (`CapturePacketLedger`, `getRenderTimestamp`, `WASAPIInputDevice`, `WASAPIOutputDevice`, the run loop). `InputTimeline` and `getOutputFrameTimeNs` are gone. Uses `CallbackTimeHelpers::alignToApplicationSample` (P007.1).
+
+**Why:** WASAPI stamps every capture packet with the QPC time of its first frame, and `IAudioClock` says which frame of the render stream is playing at a QPC time. Neither is a time for the callback's buffer: capture packets are queued and cut into callbacks of another size, and the render clock reading is not at the buffer's first frame. The context therefore carries each native observation unchanged, with the offset from the callback's first frame to the observed frame. Nothing is projected from a nominal rate or a queue length.
+
+**Contract:**
+
+| | `inputStream` | `outputStream` | `processingCycle` | `hostTimeNs` |
+|---|---|---|---|---|
+| Native source | `IAudioCaptureClient::GetBuffer` QPC position of a packet | `IAudioClock::GetPosition` position and QPC | absent | absent (stock: WASAPI never set it) |
+| Reference point | the capture time of the packet's first frame | the frame being presented at that QPC time | - | - |
+| Observation or prediction | observation | observation (a position that has been presented) | - | - |
+
+- **Clock conversion:** GetBuffer's and GetPosition's QPC values are in units of 100 ns on the `Time::getHighResolutionTicks()` clock and origin, so `timeNs = qpc * 100`, including for 0. The 100 ns unit is the OS's own conversion of the QPC count (count x 1e7 / frequency): it is exact only for a 10 MHz QPC (this PC's), and otherwise (HPET, ACPI-PM) the value carries up to 100 ns of the OS's rounding; nothing in the SDK adds to it. The input time is never altered.
+- **Input offset:** a ledger of packets (first frame in a running count of frames appended, size, time, flags) sits beside the queue. A callback takes the oldest queued frames, after leading padding when fewer than wanted are queued. The observation is that of the packet holding the first real sample of the buffer; its offset is `packet first frame - first real sample + padding`: zero for a packet taken whole, negative once part of it was taken by earlier callbacks, positive after padding. If the first real sample's packet is not in the ledger (frames queued with no record), or the buffer has no real sample, the role is absent; nothing is back-projected. Flags travel with the packet: `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY` gives `nativeDiscontinuity` and `AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR` gives `nativeTimestampError` (the time is still delivered); `SILENT` is ignored. The ledger is reset in `start()`, sized by the queue's capacity, and allocates nowhere else.
+- **Output position:** the stream position is `position * rate / frequency` frames, `frequency` being `IAudioClock::GetFrequency` (it is not necessarily a frame count). It is aligned once to the nearest frame by `alignToApplicationSample` (half-frame residual rounds up; the time moves by the residual at the application rate, never more than half a period). The offset is the aligned position minus the stream position of the callback's first output frame, which is `RenderStreamCorrespondence::callbackStart()`, the count of frames released to the render client since `open`, including the initial silence. `S_FALSE` from `GetPosition` gives `nativeReducedAccuracy`; a failed call, a zero or oversized frequency, or a missing clock gives absence.
+- **Render after an underrun (SPEC ruling 9):** measured on the Focusrite endpoint. The position counts only submitted frames (it stands still during an underrun and continues from the same place), but after a 600 ms underrun its (position, QPC) pair no longer matches presentation: against an ASIO reference the output role was 8 to 16 ms off for the rest of the run while the input role was unchanged. So the output role is absent from the first detected underrun until the device is opened again. Detection is the render loop's own bookkeeping (`RenderStreamCorrespondence`): every successful `GetCurrentPadding` taken before a write goes to `paddingBeforeWrite`, in shared and exclusive mode alike and for the first application write after `start()`'s silence as for any other; a padding of 0 once any frame has been released latches the loss. A padding that cannot be read before a write is a lost correspondence, and a clock reading ahead of the frames released latches it too. There is no exemption for the first block.
+- **Start-up dry, measured consequence (Focusrite, shared, 48 kHz / 480, this PC):** the engine reports a padding of 0 about 0.7 ms after `start()` has released 1056 frames of silence, before the application's first write, so the latch fires at the first write of every run and the output role is absent from callback 0 to the end of every run (20 s run, 1999 of 1999 callbacks; the 60 s run with a 600 ms stall at 30 s, 5944 of 5944; input role present throughout). The engine takes the initial frames into its own buffer as soon as the client starts, so a padding of 0 right after start is how the stream begins, not something the application can avoid by ordering. Two orderings were measured and not adopted. Starting the client only after the first application block was written (lab-only experiment, the 480-frame block released first) still read a padding of 0 at the second write 0.9 ms later. The silence already fills the whole 1056-frame buffer, so there is no longer pre-fill to try. With the latch disabled in the lab so that the loop L can be compared, five sessions each of 30 s gave per-session L medians (after 5 s, ms): current ordering 192.16, 186.48 (96 xruns), 184.38, 184.46, 186.32; start-after-first-block 184.43, 176.45, 192.36, 192.33, 184.23. The spans are 7.8 ms and 16.1 ms, against the 1.0 ms required, and the first-block ordering has more xruns, so it removes neither the dry nor the session-to-session steps and is not adopted. On this PC the WASAPI output role is therefore absent for every shared-mode run; the input role is unaffected. Data: `hw-windows/data-r3/` (`dry0`, `arm0`, `arm*_s*`, `L480stall_final`).
+- **Exclusive mode (measured, Focusrite output, 48 kHz / 480, exclusive output only: the endpoint's input refuses exclusive duplex with "Couldn't open the input device!"):** the padding is read after the event and before `GetBuffer`, for the latch only; the write stays the whole buffer. At the event it is 480, the whole buffer, at every pass of a clean 15 s run (1501 reads of 480; the output role present in 1500 of 1500 callbacks), and it is 0 at every pass after an underrun: stalls of 600, 40 and 25 ms each left it at 0 from the stall to the end (535, 582 and 584 reads) and the output role absent from the stall to the end (48 %, 46 % and 46 % of callbacks present, all before the stall), while a 15 ms stall (about one and a half periods) caused no underrun, kept the padding at 480 and left the role present throughout. So with this driver the padding is a usable underrun signal in exclusive mode and the latch works there; no exclusive-mode click loop was measured, and other drivers may differ (Microsoft documents the padding as of no use there). Where the padding cannot be read, the role is absent from that write.
+- **Start-up settling:** in the first 4 to 5 s the output time settles by about 14 ms. That is the native timing of a correctly associated observation and is forwarded unchanged (REQUIREMENTS section 5); nothing is smoothed or dropped.
+- **Roles in a callback:** `{ nullptr, inputStream, outputStream, nullptr }`.
+
+**Verification:** Windows `UnitTestRunner --category=Audio` (Release, `_build/juce-r6-utr`, commit `661880267f`): `WASAPI device timestamps` 23 of 23, whole run 288 of 288 cases, exit 0; the same on the whole .6 series. Hardware as described under the start-up dry and exclusive-mode items above (lab built from `661880267f`; the per-write padding log and the ordering experiment were temporary lab-only patches, not in the commit).
+
+**Limits:** Measured on the Focusrite interface with a loopback cable (output 1 to input 1), shared mode at 48 kHz / 480 and 192 frames, and exclusive output only at 480; not measured: low-latency mode (`IAudioClient3`; if its buffer equals one engine period a steady-state padding of 0 would falsely latch the loss), shared mode with sample-rate conversion, exclusive duplex (the input refused), and any other exclusive driver. On this PC the shared-mode output role is absent for the whole of every run (start-up dry above); the loop L measured in earlier sessions (185 to 192 ms, session-dependent in 8 ms steps) is therefore only available with the latch disabled. The input offset is zero in a steady state only when callbacks and packets are aligned; otherwise it is the (negative) distance back to the packet's first frame.
+
+P009 (lynco-8.0.12.2 to .5): Forwarded WASAPI input and output times as `inputHostTimeNs` and `hostTimeNs`, projecting the capture time of the first queued frame back from the newest packet and the output frame time forward from `IAudioClock` with a nominal rate. Replaced by P009.1 in .6: the callback context now carries per-role native observations (`inputStream`, `outputStream`) with the sample offset that goes with each, taken from the packets and clock readings themselves, and `hostTimeNs` returns to stock (empty).
 
 ### P010: Oboe stream recovery is reported through the device lifecycle
 
@@ -186,43 +208,50 @@ An app that defines a macro does so at its own build boundary (for example `targ
 - **Default behaviour:** all backends. An app whose callback overrides `audioDeviceError` now receives the errors its devices report, on the thread the device reports them from (`AudioDeviceManager` passes them on unchanged). Apps that do not override it see no change.
 - **Test evidence:** Tested 2026-10-23, Windows, `UnitTestRunner` Release, `--category=Audio`. A mock device reports `"Audio stream error: ErrorInternal"` to the callback it was started with; a callback added to the manager must receive exactly that string once. With the patch: 220 tests completed, 0 failures (219 before the new case). With the override removed and the test kept: the new case fails 2 checks (expected 1 received error, got 0; expected the message, got an empty string) and 219 tests completed.
 
-### P013: Oboe callbacks carry device times
+### P013.1: Oboe forwards device timestamps
 
-- **Files:** `modules/juce_audio_devices/native/juce_Oboe_android.cpp`, `modules/juce_audio_devices/juce_audio_devices.cpp`, `modules/juce_audio_devices/audio_io/juce_StreamFrameTimes.h` (new)
-- **Changes:** fills `hostTimeNs` and `inputHostTimeNs` (P007) in the Oboe device, in ns on `CLOCK_MONOTONIC`, on Android 11 (API 30) and later. The level is read once per session with `android_get_device_api_level()`; below 30 both stay null and the new code makes no call into Oboe (Oboe advises against `getTimestamp()` from a data callback before R).
-  - **Both times:** the stream's `getTimestamp (CLOCK_MONOTONIC)` says that frame `framePosition` passed the device at `timeNs`. The time of another frame is `timeNs` plus (frame index - `framePosition`) at the stream's sample rate, rounded to the nearest ns. That arithmetic, and the rules for when there is no time, are two small templates in `juce_StreamFrameTimes.h` (built and unit tested on every platform, the stream is a lambda).
-  - **Input:** after the `read()` in the output stream's callback, the first frame of this callback's input is `getFramesRead() - framesJustRead`. A short read is timed from its own first frame. A read of nothing or an error, or a failed `getTimestamp()` (which happens for the first few callbacks of a stream), gives null.
-  - **Output:** the first output frame of the callback is `getFramesWritten()` read in `onAudioReady`. That count does not yet include this callback's frames: AAudio writes the callback's buffer after the data callback returns, and Oboe's OpenSL ES stream adds `mFramesPerCallback` after `fireDataCallback()`. The time is a prediction of when the frames being produced will be presented. Null if `getTimestamp()` fails.
-  - **Context:** `hostTimeNs` is the output time when the callback has output channels and the input time otherwise; `inputHostTimeNs` is the input time. JUCE's session always opens an output stream and runs the callbacks from it, so an input-only configuration still gets callbacks, with `hostTimeNs` equal to `inputHostTimeNs`; an output-only configuration has no input stream and a null `inputHostTimeNs`.
-  - The latency calculation (`getLatencyFor()`) is unchanged. The callback gains, on API 30 and later, one `getTimestamp()` and one frame count per stream; nothing is allocated or locked by this patch.
-- **Why:** the callback context was empty on Android. On a Pixel 7, callback entry on Oboe had a jitter std of 233 to 249 µs and a maximum of 2.4 to 3.0 ms, against 144 to 187 µs and 0.78 to 0.88 ms for the stream's own input timestamps.
-- **Default behaviour:** Android Oboe device only, and only on API 30 and later; an app that ignores the two fields is unaffected apart from the extra calls. Below API 30 nothing changes.
-- **Test evidence:** Tested 2026-10-23.
-  1. Unit tests: `UnitTestRunner` built out of tree as for P008, run as `UnitTestRunner --category=Audio` (Windows 11, MSVC, Release). With this patch: exit code 0, `All tests completed successfully`, 229 `Completed tests` lines (220 before, plus 9 `Stream frame times` cases), no `!!!` lines. Each of these changes to the helper, with the tests kept, gives exit code 1:
-     - the offset subtracted instead of added: 10 checks fail in 5 cases;
-     - the input block's first frame taken as `getFramesRead()` without subtracting the frames just read: 4 checks in 2 cases;
-     - the support flag ignored: 3 checks in 1 case (the stream is asked, and a time is returned);
-     - a failed timestamp ignored: 3 checks in 1 case;
-     - the offset truncated instead of rounded: 1 check in 1 case.
-  2. Compiles: the arrival-timestamps lab app (outside this repository), a variant that records `hostTimeNs` and `inputHostTimeNs`, builds against this tree for `arm64-v8a` and `x86_64` with NDK 28.1.13356709 and CMake 3.31.6; no warnings from `juce_Oboe_android.cpp` or the new header.
-  3. Android 15 emulator (`system-images;android-35;google_apis;x86_64`, `-no-audio`), Oboe duplex 48 kHz, buffer 192, 15 s: both times were present in 1181 of 1182 callbacks (null only in the first, where `getTimestamp()` fails). Input-only: 1352 of 1353, and `hostTimeNs` equal to `inputHostTimeNs` in every one. Output-only: `inputHostTimeNs` null in all 1131 callbacks, `hostTimeNs` present in 1130. A scratch build with a log line per callback (not in this repository) showed the output counter at 0 in the first callback and growing by exactly the previous callback's `numFrames` in each of the 892 later ones, 7 short reads and 2 reads of nothing (null input time) among them, and, whenever the stream's pair was unchanged between two callbacks, the output time advancing by exactly the previous `numFrames` (449 of 449) and the input time by the frames read (277 of 281; the other 4 follow a change of the pair between the two `getTimestamp()` calls of the scratch build). The emulator's timestamps are coarse (they move in steps of about 4 ms), so its jitter says nothing about a phone.
-  4. Android 10 emulator (`system-images;android-29;google_apis;x86_64`), same run: 725 callbacks, both times null in all of them. A build whose P013 `getTimestamp()` helper logs each call showed 0 calls on API 29 and 1 per stream per callback on API 35.
-  5. Pixel 7, Android 16 (`CP1A.260405.005`), 2026-10-23, 40 s acoustic loop (phone speaker to phone microphone), Oboe 48 kHz, run with `tools/run_android_p013.sh` of the arrival-timestamps harness. Both times were present in every callback after the first 5 s (17489 at buffer 192, 17505 at 960); input-only, present in all 17500 with `hostTimeNs` equal to `inputHostTimeNs` in every one. Standard deviation of each time against its frame count: input 135 and 108 µs, output 134 and 128 µs (the lab's own stream timestamps: 144 to 187 and 103 to 115; callback entry: 209 and 259). Loop on the device times: 10.81 ms at 192 and 10.75 ms at 960 (sd 184 and 215 µs, 114 clicks each, none more than 2 ms off), against the lab's 11.03 and 10.98. The frame-count loop, which uses no times, moved too (21.67 against 21.92 ms at 192, 37.62 against 38.89 at 960), and at 192 the device-time loop minus the frame-count loop is -10.88 ms against the lab's -10.89, so the 0.2 ms shift is in the acoustic path between sessions, not in the times.
+**Files:** `modules/juce_audio_devices/native/juce_Oboe_android.cpp`, `modules/juce_audio_devices/audio_io/juce_CallbackTimeHelpers.cpp` (`getOboeInputTimestamp`, `getOboeOutputTimestamp`).
 
-### P014: CoreAudio callbacks carry device times for every chunk and for their input
+**Why:** a consumer that wants the device clock relation needs the stream's own timestamp associated with the callback's buffer, not a projection.
 
-- **Files:** `modules/juce_audio_devices/native/juce_CoreAudio_mac.cpp`, `modules/juce_audio_devices/audio_io/juce_CallbackTimeHelpers.cpp` (new), `modules/juce_audio_devices/juce_audio_devices.cpp` (one include)
-- **Changes:** fills `hostTimeNs` and `inputHostTimeNs` (P007) in the CoreAudio backend, in ns on the mach host time line converted with `timeConversions.hostTimeToNanos`, for every chunk of a buffer.
-  - **Chunks:** CoreAudio gives the IOProc one stamp per direction for the whole buffer and `processBufferChunk()` splits it into chunks of the device's buffer size; it passed a time to the first chunk only. A chunk's time is the stamp's host time plus the chunk's offset at the sample rate, rounded to the nearest ns (P008's arithmetic). A null stamp, or one without `kAudioTimeStampHostTimeValid` in `mFlags`, gives a null time, for the output stamp as well as the input one (the `jassert` in `checkTimestampsForDiscontinuity` stays).
-  - **Input:** `inputHostTimeNs` is `inInputTime` advanced as above, when the callback has input channels. `hostTimeNs` is the output stamp's time when the callback has outputs and the input stamp's otherwise (as before).
-  - **Combined devices:** `AudioIODeviceCombiner` calls the app's callback from its input device's callback, with an output scratch buffer. With outputs it now passes `inputHostTimeNs` = the input device's input time and `hostTimeNs` = null (the output is presented later on another device and no relation between the two clocks is established); without outputs it passes the input device's context unchanged. `updateSampleTimeFromContext` still reads the original context. No cross-device synchronisation is added.
-  - **Helpers:** `CallbackTimeHelpers::timeOfSample()` (offset arithmetic, flag and null checks) and `combinedCallbackContext()` are in a new file that compiles on every platform, with their unit tests.
-- **Why:** the CoreAudio context had a time for the first chunk only, none for the input, and a combined device's callback with outputs held an input time in `hostTimeNs`.
-- **Default behaviour:** an app that ignores the two fields is unaffected. `hostTimeNs` is now present on every chunk (it was null after the first) and null when the stamp's host time is not flagged valid (it was passed unchecked). A combined device's `hostTimeNs` is null where it held the input time. macOS only. The iOS backend is unchanged.
-- **Test evidence:** Tested 2026-10-23. There is no hardware qualification: nothing here was run against a CoreAudio device.
-  1. Windows 11, MSVC (Visual Studio 18): `UnitTestRunner` built out of tree with `cmake -S <JUCE> -B <build> -DJUCE_BUILD_EXTRAS=ON`, then `cmake --build <build> --target UnitTestRunner --config Release`, run as `UnitTestRunner --category=Audio`. With this patch: exit code 0, `All tests completed successfully`, 226 `Completed tests` lines (219 before, plus 7 `Callback time helpers` cases), no `!!!` lines. Three changes to the helpers, with the tests kept, give exit code 1: the flag check removed fails 3 checks in the flag case; the rounding removed (truncation) fails 2 checks in the chunk case; the combined context keeping `hostTimeNs` with outputs fails 2 checks in the combined case.
-  2. `juce_CoreAudio_mac.cpp` itself was not compiled. The changed block of `processBufferChunk()` was compiled as extracted text against stand-in `AudioTimeStamp`, flag and conversion types with the Android NDK 28.1.13356709 clang (`-std=c++17 -fsyntax-only -Wall -Wextra -Wconversion -Wsign-conversion -Wshadow`): no diagnostics.
-  3. Mac: compiled, unit-tested and run on a GitHub `macos-latest` runner from a branch outside this series (`.github/workflows/macos-check.yml`), `UnitTestRunner --category=Audio`. Result (run 39950801825, 2026-10-23, on the branch `ci/macos-check` at 0f0ec0a6ed, which is this patch on P011): built with no warnings in the changed files; 214 Audio tests completed, all passing, including the 7 new ones. Run 39954189927 on the whole series, P001 to P014: 224 Audio tests completed, all passing. No Mac audio hardware was used.
+**Contract:**
+- Roles: `inputStream` and `outputStream`; `processingCycle` and `hostTimeNs` absent (stock Oboe `hostTimeNs` is empty).
+- Native source: `AudioStream::getTimestamp (CLOCK_MONOTONIC)`, read once per callback per stream, only on Android 11+ (API 30, the existing guard); otherwise absent. Reference point: the stream's frame position passing the device (observation, not prediction). The same reading also gives the latency (`getLatencyFor()`, JUCE's own arithmetic), so the callback makes no more calls into Oboe than upstream.
+- Clock: CLOCK_MONOTONIC ns, the `Time::getHighResolutionTicks()` timeline; no conversion, so no rounding. Streams at the application's rate; a converted stream's timestamp is aligned to application frames inside bundled Oboe (P018).
+- Input offset = native position minus the first frame of the buffer (`getFramesRead()` after the read minus frames just read). A short read has the frames at the buffer start; no successfully read frame means no input observation. The offset can be positive: the frame Android timestamps can be one the device has captured but the application has not read yet.
+- Output offset = native position minus `getFramesWritten()` at callback start.
+- Native timestamps repeat: Android refreshes a stream's (frame, time) pair about every 50 ms (about 20 Hz), so most callbacks carry the same pair as the one before, at an offset that has moved with the buffer. A repeated pair is forwarded unchanged; nothing is extrapolated between refreshes.
+- Time and flags unchanged (`nativeFlags` 0: Oboe reports no qualifications).
+
+**Verification:** `Oboe stream timestamps` (6 cases) in `UnitTestRunner --category=Audio`, Windows, and on the whole .6 series (whole run 288 of 288); NDK 28.1 syntax compile of `juce_audio_devices.cpp` for arm64 Android with `JUCE_UNIT_TESTS`. Pixel 7, Android 16, a Release lab app built on a tree whose Oboe code is identical to this series, 2026-11-11: at 48 kHz on the built-in devices, 31,043 callbacks, both roles present in every one, flags 0, 29,814 of them a repeated pair, no position or time going backwards, input offsets -2448 to +240 frames, output offsets -3264 to -528, and the rate between distinct pairs 47,980 to 48,020 Hz over 62 spans; at 44.1 kHz (converted, P018), 28,553 callbacks, the same, input -2410 to +244, output -3043 to -505, 44,087 to 44,115 Hz.
+
+**Limits:** devices before Android 11 forward no roles; streams that fail `getTimestamp` give absence for that callback. No absolute (acoustic loop) check of the roles was made.
+
+P013 (lynco-8.0.12.2 to .5): Filled `hostTimeNs` and `inputHostTimeNs` from each stream's `getTimestamp` pair, projected to the callback's first input and output frames at the stream's nominal rate. Replaced by P013.1 in .6: the projections were estimates; the native observation is forwarded with its offset.
+
+### P014.1: CoreAudio forwards device timestamps
+
+**Files:** `modules/juce_audio_devices/native/juce_CoreAudio_mac.cpp`; shared helpers in `audio_io/juce_CallbackTimeHelpers.cpp` (`getBufferStartTimestamp`, `getCoreAudioChunkTimes`, `getCombinedCallbackContext`, `CombinedOutputCorrespondence`; P020 shares `getBufferStartTimestamp`).
+
+**Why:** a CoreAudio IOProc is handed `inInputTime` and `inOutputTime`: the host time at which the first frame of the input buffer was acquired and at which the first frame of the output buffer will be presented. These are device observations of the buffer the callback is given. JUCE splits an IOProc buffer into chunks no longer than the application's buffer size, so a chunk that starts k frames in sees the same moment k frames earlier. When one input and one output device are combined by `AudioIODeviceCombiner`, the application's output goes through a FIFO to the output device, whose stamp names a frame of what that device read; the application can be given that stamp only with the proven correspondence between the FIFO frame and its own buffer.
+
+**Contract:**
+- Ordinary device. `inputStream` = `inInputTime` and `outputStream` = `inOutputTime`, each only when the callback has channels in that direction and the stamp has `kAudioTimeStampHostTimeValid` (otherwise absent). Native source: the AudioTimeStamp passed to the IOProc. Reference: the first frame of the IOProc's buffer. Observation, not prediction. A chunk starting at k frames has `sampleOffset` = -k, the same `timeNs` and `nativeFlags` 0. `processingCycle` absent.
+- Clock: `mHostTime` (mach_absolute_time ticks) to ns by the same `HostTimeToNanos` conversion stock JUCE uses (`mach_timebase_info` numerator/denominator on the 64-bit tick count); no further rounding is introduced by this patch.
+- `hostTimeNs` is stock 8.0.12: first chunk only, the output stamp's host time when the callback has outputs and the input stamp's otherwise, converted without consulting the flags, none without that stamp.
+- Combined device. The application callback runs from the input device's callback. `inputStream` is the input device's role (offset relative to the application buffer, which is the input chunk); `hostTimeNs` is the input device's. `outputStream` is the output device's `inOutputTime` for the FIFO frame it names, at offset (FIFO address of that frame) - (FIFO address of the application buffer's first frame), a negative number while the output device is behind the application. `CombinedOutputCorrespondence` records the FIFO address range of each run of consecutive application writes and the output device's last stamp together with the address of the frame it names; the stamp is accepted only if the named frame was read in that same output callback (not as padding) and lies in the current run of written addresses. A write that does not continue the previous one, an xrun, or a reset starts a new run and loses the observation until a frame of the new run is read and stamped. The latest observation is repeated, its offset falling with the application's progress, until a new one replaces it; its flags travel with it. FIFO times and rounded addresses derived from times are never used for correspondence. `processingCycle` absent.
+- Threads. The application callback (input device thread) calls `observationFor` and `wrote`; the output device thread calls `read`; `reset` runs on either. Each side publishes its own state through a single-writer sequence lock built from `std::atomic` words, and `reset` only bumps an atomic epoch. No locks, no allocation; a reader that collides with a write repeatedly sees no value, which only means "absent".
+
+**Verification:**
+- Windows `UnitTestRunner --category=Audio` (Release) on the whole .6 series: `CoreAudio chunk timestamps` 6 of 6, `CoreAudio combined output timestamps` 8 of 8, whole run 288 of 288. The entries below were taken while the other backends' patches were still in progress.
+- Windows `UnitTestRunner --category=Audio` (Release, `_build/juce-r7-utr`, other lanes' backend wiring replaced by a throwaway uncommitted fix so the tree compiles): `Callback timestamp alignment` 9/9, `AudioDeviceManager` enforcer cases, `CoreAudio chunk timestamps` 6/6 and `CoreAudio combined output timestamps` 8/8 pass. Failures remaining are the suites of other lanes' stubs (Oboe, ASIO, ALSA, JACK, WASAPI).
+- GitHub CI `ci/timestamps-apple`, macos-latest (macOS 26.7.2, Xcode 26.6): `UnitTestRunner --category=Audio` builds (compiling `juce_CoreAudio_mac.cpp`) with no warnings from the changed files; the same suites pass; only the other lanes' suites fail (run 42995599691). iOS simulator compile of `juce_audio_devices` (arm64, iPhoneSimulator26.5 SDK, Xcode generator) succeeds.
+- Combined-device integration (run 42997767678): BlackHole 2ch as input and BlackHole 16ch as output, both loaded on the runner after `sudo killall coreaudiod`; 48 kHz, 256 frames, 20 s through `AudioDeviceManager`: 3720 callbacks. After the first second `inputStream` was present in 3532 of 3532 callbacks and `outputStream` in 3392 (96.0%); `processingCycle` never; while an `outputStream` repeated (88 repetitions) its offset fell by exactly the previous `numSamples` every time; 703 spans of at least one second between distinct observations implied 48 kHz within 1% in every case; after a 200 ms block of the application callback the output role was absent in 44 callbacks starting with the next one and returned at the fifth. The runner's virtual devices produced 41 xruns in the 20 s (reported by the combiner, the forced one included), which is why the output role is absent in about 4% of callbacks.
+- Combined-device absolute association (macOS CI, BlackHole 2ch in, BlackHole 16ch out, 48 kHz / 256): a one-sample marker written at a known application output frame, captured through BlackHole 16ch's loopback opened as an ordinary input. Over 9 runs, 430 judged markers were captured where the forwarded `outputStream` predicted, within 4.8e-5 frames (the two ns conversions' rounding); with one buffer added to the combiner's output offset (a mutant), every one of 472 markers was off by exactly +256 frames. The tolerance is 0.5 frame, so any whole-frame mis-association fails. BlackHole reports zero device, safety-offset and stream latency, so the rail does not test their handling.
+
+**Limits:** the combiner's name is the output device's name, so the integration check identifies it by two distinct opened devices and by the combiner's xrun counter, not by a "in + out" name. The wiring of the ordinary-device path has no unit test; it is checked by review and by the compile. A real hardware device pair was not run; BlackHole is a virtual driver with no latency of its own beyond its buffering.
+
+P014 (lynco-8.0.12.2 to .5): Projected the CoreAudio output host time across split chunks by adding each chunk's duration at the device sample rate, and gave the combined device only the input host time. Replaced by P014.1 in .6: each chunk now sees the IOProc's own stamps unchanged with an offset of minus its start, and the combined device's output role is forwarded through real FIFO bookkeeping, so no time is advanced by a computed duration.
 
 ### P015: Android display area follows the Activity's window, and is refreshed on resume
 
@@ -269,8 +298,6 @@ An app that defines a macro does so at its own build boundary (for example `targ
   Lifecycle operations and `getLastError()` are serialized. Never call getLastError()
   from the audio callback: stop holds the
   control lock while waiting for audioCallbackMutex, which the callback holds.
-  Lending the client callback
-  to the audio thread cannot temporarily report stopped playback.
   Other session/configuration getters still require caller serialization with lifecycle
   changes; P016 does not make them safe for arbitrary concurrent queries.
 - **Input validity:** missing microphone permission returns before session creation.
@@ -333,11 +360,29 @@ An app that defines a macro does so at its own build boundary (for example `targ
   Application recovery and clean smoke checks are recorded by the consuming application's PR.
   Other Android versions/devices and desktop audio were not qualified. This patch does
   not fix the separately reproduced vendor MMAP process-death cleanup crash.
+- **Natural runs at `5ab7720`:** Release on Pixel 7, Bluetooth A2DP output and the
+  built-in microphone, 30 force-stop relaunches: 27 live input, 3 visible errors with
+  Retry, no silent failure (c2a16c6 had 3). 13 launches hit -899 at start; 12 recovered
+  and 1 reported its error. With P017 (`7178a57`), 30 more: 30 live input, no silent
+  failure or error; no -899 occurred.
+- **Not fixed:**
+  - A competing recorder that takes the microphone while the device runs on the
+    system default devices with a 48-sample buffer leaves input callbacks delivering
+    zeros with no error, also after the recorder exits; c2a16c6 behaves the same. With
+    explicitly selected devices and a 1920-sample buffer the same takeover reports an
+    error, and one Retry restores input.
+  - Device IDs are read when JUCE scans devices. An audio-server restart renumbers
+    Android's devices, so a later open or recovery reopen can request an ID that no
+    longer exists (Android then picks the route) or that now names another device. In
+    one of 30 launches the output opened on the speaker's Bluetooth SCO profile instead
+    of A2DP. Upstream behaviour, not changed by P016 or P017.
 
 ### P017: Notify clients when an Oboe device is explicitly stopped
 
 - **Files:** `modules/juce_audio_devices/native/juce_Oboe_android.cpp`, its adjacent
   `_test.cpp`, and the instructions in `extras/OboeLifecycleTests`.
+- **Why:** WASAPI and CoreAudio notify `audioDeviceStopped()` from `stop()`; Oboe did
+  not, so a client never learned that it had been stopped.
 - **Contract:** explicit `stop()`, `close()`, and reopening a running device notify
   the detached client exactly once, after native audio is quiescent. Stopped/closed
   state is visible before the notification. Repeated closure sends no duplicate.
@@ -366,3 +411,168 @@ An app that defines a macro does so at its own build boundary (for example `targ
   The suite covers direct stop/close, repeated closure, callback-visible state,
   recursive lifecycle calls, destruction, replacement, and existing P016 failure
   and recovery cases. Other Android devices and versions were not qualified.
+  A Release app on the same phone: selecting no input and no output stops callbacks
+  and the client is notified; selecting the defaults again restores live input.
+
+### P018: Associate converted Oboe timestamps with application frames
+
+- **Files:** bundled Oboe `FilterAudioStream.{h,cpp}` and
+  `DataConversionFlowGraph.h`; standalone regression in `extras/OboeTimingTests`.
+- **Why:** scaled child counters are not application delivery cursors. A 96 kHz
+  application can receive two blocks during one 48 kHz child callback; both used
+  the same timestamp target. Buffered input reads have the corresponding defect.
+  Fractional conversion also discarded part of the timestamp pair, and the pair
+  omitted the causal sample-rate converter delay.
+- **Contract:** count callback-output frames when supplied by the application and
+  input frames when consumed by it. Preserve the existing child counters for the
+  opposite sides and for blocking output. Project native timestamp pairs through
+  the converter's source-frame delay, then align the position once to the nearest
+  application frame, n = floor (x + 1/2) (a half-frame residual rounds up), with
+  the time moved by (n - x) / application rate rounded to the nearest ns, in
+  `FilterAudioStream::getTimestamp`. x = (child position * app rate - delay *
+  child rate) / child rate for output and (child position + delay) * app rate /
+  child rate for input, in exact integer arithmetic for the converter's
+  whole-frame delay (taps/2); a fractional delay would fall back to doubles. This
+  is the rule of `CallbackTimeHelpers::alignToApplicationSample` (P007.1); bundled
+  Oboe cannot include JUCE, so each copy's comment names the other and both are
+  pinned by their tests. Failed native timestamp queries remain failures. No
+  clock estimator, recovery policy, retry or application lifecycle changes.
+- **Verification:** Android arm64 Release with NDK 28.1.13356709, Pixel 7.
+  `extras/OboeTimingTests` (test source and commands there): checks=158
+  failures=0, with and without `--require-read-errors` (the latter with P019).
+  The checks cover integer/fractional/equal rates, buffered/short/empty reads,
+  counter continuity, failed queries, smooth pulse timing through all five
+  conversion qualities (expected pulse timing independent of the wrapper
+  counters; largest measured discrepancy 0.006 native frame, tolerance 0.02) and
+  the nearest-frame alignment of every frame, ties included. The unaligned
+  (floor) revision fails 30 of the 158 checks, and one with ties rounded down
+  fails 20, exactly the tie frames. A separate Release recorder using the first
+  revision's production changes captured 23,461 callbacks across 44.1/48/96 kHz
+  on Pixel speaker/microphone, with no adjacent repeated/backward available
+  context timestamps and no recorder loss/errors. A lab app on a tree with this
+  revision, 44.1 kHz: see P013.1.
+- **Limits:** counter restart coverage uses deterministic streams. Physical
+  restart/flush behavior, blocking output writes, acoustic ADC/DAC timing, other
+  devices and an application consuming these times are not qualified by these tests.
+  This does not validate arbitrary native timestamps. The delay model (taps/2) is
+  bounded by the pulse test at 0.02 native frames; if the true group delay were
+  fractional, x and so the nearest frame could differ. The conversion graph's
+  swallowing of a native `ErrorDisconnected` read, reproduced by
+  `--require-read-errors`, is repaired by P019, not here.
+
+New in .6. Revised before publication: the first revision floored the converted
+position and kept the fraction in the time; it now aligns to the nearest frame
+once, as above.
+
+### P019: Surface native read errors through the Oboe conversion graph
+
+- **Files:** bundled Oboe `AudioSourceCaller.{h,cpp}` and
+  `DataConversionFlowGraph.cpp`.
+- **Why:** an input stream that needs rate or format conversion is wrapped in
+  `FilterAudioStream`. A blocking native read that failed (for example
+  `ErrorDisconnected`) became a negative byte count inside the flowgraph, the
+  sink treated it as an empty pull, and the caller saw a successful zero-frame
+  read. A client that detects disconnection only from a failed read (P016) then
+  receives silence forever without an error. Upstream Oboe has the same code.
+- **Contract:** `AudioSourceCaller` records the Result of a failed native read.
+  `DataConversionFlowGraph::read` clears it on entry and, when the pull delivered
+  no frames and a read failed, returns that Result as the negative value that
+  `FilterAudioStream::read` already maps to an error. Frames delivered earlier in
+  the same call are returned as a normal partial read; the failure is not
+  latched, so it is reported by the next read, which hits the same native
+  stream. This matches `AudioStream::read`, which returns a frame count for a
+  partial transfer and an error otherwise. No retry, timeout or lifecycle change;
+  the callback and output paths are unchanged.
+- **Verification:** `extras/OboeTimingTests`, Android arm64 Release, NDK
+  28.1.13356709, Pixel 7. On the P018 base, `--require-read-errors` fails
+  (`read_error_contract=FAIL`, converted result 0 for native -899). With this
+  patch it passes (converted result -899) and the normal run still passes
+  108/108 checks. With P018's nearest-frame revision the suite has 158 checks and
+  passes with and without `--require-read-errors`.
+- **Limits:** verified with deterministic child streams, not a physical device
+  disconnect. A block-aligned read that fails after part of an application block
+  was copied discards that partial block (it was never counted as delivered).
+  Application-level recovery is a separate concern.
+
+New in .6.
+
+### P020: iOS forwards its render cycle time
+
+**Files:** `modules/juce_audio_devices/native/juce_Audio_ios.cpp`. Uses `CallbackTimeHelpers::getBufferStartTimestamp` from `audio_io/juce_CallbackTimeHelpers.cpp` (P014.1).
+
+**Why:** the iOS render callback receives an `AudioTimeStamp` for the buffer it is asked to render. It says when that cycle's buffer starts on the host clock, and nothing about when the input was captured or when the output will be heard (which depends on hardware and session latency that the callback does not carry). Forwarding it as the processing cycle states exactly that and no more.
+
+**Contract:** `processingCycle` is present when the render stamp has `kAudioTimeStampHostTimeValid`, at `sampleOffset` 0 with `nativeFlags` 0. Role: processingCycle. Native source: `AudioTimeStamp.mHostTime` of the AURenderCallback's stamp. Reference point: the first frame of the buffer being rendered. Observation, not prediction. Clock: `mach_absolute_time` ticks converted to ns by the same `HostTimeToNanos` conversion stock JUCE uses for `hostTimeNs` (`mach_timebase_info` numerator/denominator applied to the 64-bit tick count), so it is the `Time::getHighResolutionTicks()` timeline with that conversion's own integer rounding. `inputStream` and `outputStream` stay absent. `hostTimeNs` is stock: the same host time, present under the same condition, as before this patch.
+
+**Verification:** the seam `getBufferStartTimestamp` is covered by the suite `CoreAudio chunk timestamps` (Windows and macOS `UnitTestRunner --category=Audio`). The iOS wiring compiled for the iOS simulator (arm64, iPhoneSimulator SDK, Xcode generator, CMake `CMAKE_SYSTEM_NAME=iOS`, target including `juce_audio_devices`): see the CI run recorded in the P014.1 ledger. No device run.
+
+**Limits:** no iOS device or simulator run of the callback; the wiring has no unit test.
+
+New in .6.
+
+### P021: ASIO forwards each buffer switch's own time
+
+**Files:** `modules/juce_audio_devices/native/juce_ASIO_windows.cpp` (`callback`, `processBuffer`, `readSwitchTime`, `toSwitchTime`, `identifyClockOffset`, `collectSystemTime`, `getInterruptTimeNs`, `asioMessagesCallback`, the two switch callbacks, `open`, `close`), and the bodies of `CallbackTimeHelpers::AsioBlockTimes` and `identifyAsioClockOffset` in `audio_io/juce_CallbackTimeHelpers.cpp`. `getAsioProcessingCycle` and the backend's old `getProcessingCycle` / `measureClockOffset` are gone.
+
+**Why:** An ASIO driver stamps each buffer switch with a (samplePosition, systemTime) pair. It is the driver's own time for the block, not a capture or presentation time, so it travels as `processingCycle` and makes no claim about when samples crossed a converter.
+
+**Contract:**
+- **Role:** `processingCycle` only; `inputStream`, `outputStream` and `hostTimeNs` are absent (stock: ASIO never set `hostTimeNs`).
+- **Native source:** JUCE now answers `kAsioSupportsTimeInfo` with 1, and each switch's `ASIOTime` from `bufferSwitchTimeInfo` supplies `systemTime`, `samplePosition` and flags for that switch. A driver that calls the plain `bufferSwitch` is asked with `ASIOGetSamplePosition` instead (success stands for both valid flags; no change flags exist). `kSystemTimeValid` or `kSamplePositionValid` cleared, or a failed call, is absent for that callback. `kSampleRateChanged` or `kClockSourceChanged` sets `nativeDiscontinuity` on that switch only.
+- **Reference point / observation:** the driver's time of the buffer switch (observation). The offset is not always 0: it is the pair's `samplePosition` minus the tracked start of the current block (`AsioBlockTimes`). The first valid position of a run anchors the tracking; every later switch advances the tracked start by the block size (an invalid position still counts). A valid position is reconciled when it is not before the newest position seen, not after the tracked start, and a whole number of blocks before it; then the offset is position minus tracked start: 0 for the switch's own pair, minus one block for a stale fallback pair (the previous switch's pair repeated), and so on. A position that is not reconciled (a rewind, a pair ahead of the tracking, whether the next switch's pair read early or missed switches, or one not a whole number of blocks away) ends the association: that switch is absent, the next switch with a valid position anchors the tracking again (offset 0), and the first observation delivered after the loss carries `nativeDiscontinuity`. Absent before a valid position in the run. Known limit: an anchoring pair is taken to be its own switch's, so a stale anchor gives offsets whole blocks too high until a pair ahead of the tracking re-anchors it.
+- **Clock rule (once per run):** the driver's first eight system times are compared with three clocks read back to back at the instant `timeGetTime()` changes: QPC, interrupt time (`QueryInterruptTimePrecise`, x100 ns, looked up at run time) and `timeGetTime()` x 1e6. If all eight times are whole milliseconds the clock is `timeGetTime`; otherwise interrupt time is checked first, then QPC. A candidate matches if the newest driver time is within `maxAge` before it (`maxAge` = 2 blocks + 32 ms: a block's age, the wait below, a timer tick of spinning, and the interrupt clock's lag of up to a tick). The offset is QPC minus the matching candidate. No match: the role is absent for the run. If QPC and interrupt time both match (the two are closer than `maxAge`, e.g. a PC that has not slept since boot), the clock is taken to be interrupt time (SPEC "ASIO ambiguous clock"); a driver that really uses QPC is then off by the measured |interrupt time - QPC| gap, constant for the run and at most `maxAge`. The measurement waits one block plus 1 ms after the last collected time, because a switch that follows another at once (a driver catching up) can be given a time up to a block ahead of its arrival (measured: +4 to +5 ms at 256 frames), and the identification needs a driver time not later than the clocks. The identification runs in `open()` after the driver has started and before `isStarted` is set, so before the first callback is delivered; it never runs on the callback thread.
+- **`timeGetTime` wrap:** a `timeGetTime` clock is a 32-bit millisecond count, so a driver's time on it falls back to 0 every 2^32 ms (49.7 days of uptime). Each switch's time is unwrapped exactly (`unwrapTimeGetTimeNs`: the whole number of 2^32 ms periods that puts it within half a period of the previous switch's unwrapped time; for the first switch after an identification, of the `timeGetTime` value the offset was measured against), so the count continues across any number of wraps and the offset stays the constant it was measured as. Only for a clock identified as `timeGetTime`; QPC and interrupt time are 64-bit.
+- **Clock source change and identification failure:** the first identification stays in `open()`, after the driver has started and before `isStarted`. Every later identification (after a clock-source change) and every retry (after any failed identification, including that first one: fewer than eight times in 2 s, no tick edge, no matching clock) runs on a background thread the device owns, never on the message thread and never on the callback thread; there is no limit on attempts, with a pause of 250 ms between them. On the transition of `kClockSourceChanged` (set on this switch, not on the previous one; a flag held set over consecutive switches is one request) the callback thread does one atomic increment of a clock generation count, which makes the held offset stale (role absent) at once and is the whole request: no system call, no `AsyncUpdater`. The background thread polls the count every 10 ms. An identification publishes its offset, then the generation it started under; a newer transition makes a result in flight stale and it is discarded. `close()` stops and joins the thread before the driver is released, and `open()` resets the generations, so nothing crosses a run. The flagged switch is delivered with `nativeDiscontinuity`, only if an offset was still held.
+- **Rounding:** none beyond the QPC-to-ns unit conversion (exact for the 10 MHz QPC); interrupt time x 100 and timeGetTime x 1e6 are exact. No per-callback fitting, smoothing or rate correction; no reading is compared with callback arrival once identified.
+- **Not done:** no re-measurement within a run except after a clock-source change or a failed identification.
+
+**Verification:** Windows `UnitTestRunner --category=Audio` (Release, `_build/juce-r6-utr`, commit `661880267f`): `ASIO processing cycle timestamps` 17 of 17, whole run 288 of 288 cases, exit 0; the same on the whole .6 series. Hardware (Focusrite USB ASIO, loopback cable out 1 to in 1, lab built from `661880267f`, no `-dirty`), on a PC whose interrupt time is about 118 s behind QPC: `processingCycle` in 100 % of callbacks in every run, offset 0, flags 0; the interrupt-time offset was applied (converted time within milliseconds of callback entry, not 118 s). 592.9 s run at 48 kHz / 256 (a foreground run is capped at 10 minutes, so 592 s): least-squares slope -1.53 ppm over all callbacks (-1.26 ppm from 120 s), but the tight edges are flat: 90th, 99th and 99.9th percentile per 20 s bin -0.16, -0.46 and -0.08 ppm. The driver was far jitterier in this session than on the earlier runs (repeated times in 32.6 % of callbacks against 1.6 %, median 4.4 ms before entry against 0.6 ms, spread 5 ms against 0.5 ms), which is why the least-squares slope is above 1 ppm; an A/B on the same driver state with the pre-change code (`950f871a35`) gave the same figures (repeats 32.6 % vs 33.2 %, median -4.40 vs -4.49 ms, spread 5.29 vs 5.37 ms over 60 s), so it is the driver's state today and not this change. ASIO4ALL (48 kHz / 256, 120 s): identified as `timeGetTime`, present 100 %, least-squares slope -0.79 ppm (also noisier than the earlier -0.04 ppm run: residual sd 1.8 ms against 0.5 ms). The clock-source switch check was not run: it needs a clock source to change in the driver's panel, and I did not open the panel or change any driver setting. The unwrap and the re-identification thread's retry and switch paths are covered by the seam cases and by review only; no clock-source change, wrap or failed identification occurred on the device. Data: `hw-windows/data-r3/` (`asio_drift256`, `a4a120`, `ab_*`).
+
+**Limits:** The Focusrite driver's time info is jittery: in the earlier sessions about 1.6 % of switches repeated the previous time and 1.9 % went backwards (spacing sd 2.3 ms) while the sample positions advance normally, and in the latest session a third repeated, so the offset is 0 in every callback. That is the driver's own timing, forwarded unchanged, so `processingCycle` is not a low-jitter time on that driver (click arrival against it has a robust sigma of 3 to 4.4 ms over 60 s). A `timeGetTime` clock is quantised to the timer period, so its times are up to a period earlier than the true switch; the conversion does not add to that. If the driver actually uses QPC and QPC is within `maxAge` of interrupt time, the identified interrupt-time offset leaves a constant error of that gap (at most `maxAge`) for the run. The block tracking cannot tell a stale anchoring pair from a good one (see the contract), and a real missed switch costs one absent switch and a flagged re-anchor. An identification whose driver times straddle a `timeGetTime` wrap matches no candidate and is retried. Between a clock-source change and the next identification (tens of milliseconds to seconds, or longer if the driver pauses its callbacks) the role is absent.
+
+New in .6. Revised before publication: the first draft forwarded `ASIOGetSamplePosition`'s `systemTime` at offset 0, treating the driver's clock as QPC unless every time was a whole millisecond. On the Focusrite driver `systemTime` is on the Windows interrupt-time clock (118.19 s from QPC on the test PC), and about 12.8 % of back-to-back switches were handed the previous switch's pair, so the time was both on the wrong clock and a block early; the time info the driver delivers with each switch is now used, and the clock is identified against QPC, interrupt time and `timeGetTime`.
+
+### P022: ALSA forwards device timestamps
+
+**Files:** `modules/juce_audio_devices/native/juce_ALSA_linux.cpp` (`ALSADevice`, `ALSAThread::run`); `audio_io/juce_CallbackTimeHelpers.cpp` (`getAlsaTimestamp`).
+
+**Why:** A direct ALSA PCM reports, in one `snd_pcm_status` call, how many frames are available and the time of the hardware pointer update they belong to. That is a native observation of the device ring that no other JUCE path exposes. Forwarding it lets a consumer relate the device's own timeline to the callback's buffer without estimating latency.
+
+**Contract:**
+- Roles: `inputStream` and `outputStream`, each from its own PCM. `processingCycle` and `hostTimeNs` stay absent/stock (`hostTimeNs` is `nullptr`).
+- Native source: `snd_pcm_status` -> `avail` and `htstamp`, in one call (one coherent observation). Reference point: the frame at the hardware pointer, expressed against the application cursor (frames the application has read from, or written to, that PCM since it was opened). Observation, not prediction.
+- Capture: the reading is taken right after the buffer is read, so the pointer is at `framesRead + avail` and the buffer began at `framesRead - numSamples`; the offset is `avail + numSamples` (>= 0). Playback: the reading is taken right before the buffer is written, so the pointer is at `framesWritten - (ring - avail)` and the buffer begins at `framesWritten`; the offset is `-(ring - avail)` (in (-ring, 0]). `ring` is the hardware buffer size.
+- Clock: `tstamp_mode` is set to ENABLE and `tstamp_type` to `SND_PCM_TSTAMP_TYPE_MONOTONIC` when the PCM is configured, then read back from the PCM's software parameters. Only if it reads back MONOTONIC are readings forwarded (SPEC ruling 7: one configured type; otherwise the role is absent). CLOCK_MONOTONIC is JUCE's clock on Linux, so seconds and nanoseconds convert to `timeNs` exactly (`s * 1e9 + ns`, no rounding).
+- Absent when: the PCM is not a direct hardware PCM (`snd_pcm_type != SND_PCM_TYPE_HW`: `default`, `plughw`, `dmix`, `plug`, ... may convert rates or share the ring, so no application-frame association exists); the state is not RUNNING (before start, after an xrun, after recovery until the stream runs again); the status time is zero (not stamped); `avail` is outside `[0, ring]`; for capture, the latest read returned fewer than `numSamples` frames or an error.
+- `nativeFlags` is always 0: ALSA's status carries no qualification that maps to the interface flags.
+- Lifecycle: the application cursor starts at 0 when the PCM is opened (each `open` of the device creates new `ALSADevice` objects), so nothing crosses a stop/start.
+- Real-time cost: one `snd_pcm_status` ioctl per role per callback, on the stack.
+
+**Verification:** Windows `UnitTestRunner --category=Audio`: suite `ALSA device timestamps` 5 of 5 cases pass. WSL Ubuntu (ALSA and JACK enabled): same suite 5 of 5. On the whole .6 series (Windows, Release): the same suite passes, whole run 288 of 288. `snd-aloop` is not available in the WSL kernel (6.18.33.2-microsoft-standard-WSL2 ships no module), so no loopback run was made here.
+
+**Limits:** Only `hw:` devices; a plugin device never reports, even where its slave is a hardware PCM. Short reads/writes after an xrun make the affected callbacks absent. The status `tstamp` is the time of the last hardware pointer update (interrupt-driven for most drivers); its precision is the driver's.
+
+New in .6.
+
+### P023: JACK forwards its processing-cycle time
+
+**Files:** `modules/juce_audio_devices/native/juce_JackAudio.cpp` (`jack_get_cycle_times` and `jack_get_time` resolved with `juce_loadJackFunction` into `JackAudioIODevice` members when the client is opened; `JackAudioIODevice::process`, `readClocks`); `audio_io/juce_CallbackTimeHelpers.cpp` (`JackClockReadings`, `getJackProcessingCycle`).
+
+**Why:** `jack_get_cycle_times` gives the start of the cycle the process callback is running in, as the server timed it. Forwarding it as `processingCycle` at offset 0 lets a consumer tie the callback's buffer to the server's own cycle time.
+
+**Contract:**
+- Role: `processingCycle` only (JACK has no per-stream device timestamps); `inputStream`/`outputStream` absent; `hostTimeNs` stock (`nullptr`).
+- Native source: `jack_get_cycle_times` -> `current_usecs`. In jackd2 this is `fCurrentWakeup`, the server's DLL prediction of the cycle start, not a measurement. It is a native prediction, forwarded as the server gives it; it can run slightly ahead of the callback, or a period or two behind it when a timed driver runs a late cycle back to back with the next.
+- Reference point: the first frame of the process buffer, so `sampleOffset` is 0. `nativeFlags` is 0.
+- Clock rule, applied on every callback, nothing carried between callbacks: CLOCK_MONOTONIC, `jack_get_time()` and CLOCK_MONOTONIC_RAW are read back to back, in that order (`readClocks`). JACK's clock is whichever of MONOTONIC and RAW `jack_get_time() x 1000` is closer to (a tie is MONOTONIC: no conversion when the readings cannot tell). `timeNs = current_usecs x 1000 + (MONOTONIC - that clock's reading)`: the microsecond count converts exactly (x 1000), and the added term is zero for a MONOTONIC server and (MONOTONIC - RAW) for a RAW server, in integer ns. If `jack_get_time()` is more than 1 ms from both clocks the role is absent for that callback. No once-per-run offset, no smoothing. On platforms other than Linux and BSD the readings are never close and the role is absent.
+- Error bound: the conversion adds the difference between two clocks read a few tens of ns apart, so its error is the read spacing (three reads inside one process callback, normally under a microsecond, longer if the thread is preempted between them) plus the slew of the two clocks relative to each other over one cycle (the difference changes by microseconds per second, so well under a microsecond over a 5 ms cycle). On top of that sits the prediction's own error, which is the server's.
+- Absent when: this libjack lacks `jack_get_cycle_times` or `jack_get_time` (the pointers, resolved at open and off the audio thread, are null; nothing is called and no time 0 is made up), `jack_get_cycle_times` returns nonzero, or `jack_get_time()` matches neither clock within 1 ms.
+- Real-time cost: one `jack_get_cycle_times`, one `jack_get_time` and two `clock_gettime` calls per process callback (vDSO, no syscall).
+
+**Finding (jackd2):** jackdmp 1.9.22 (Ubuntu) stamps cycles with CLOCK_MONOTONIC_RAW (jack2 `JackLinuxTime.c`). MONOTONIC minus RAW is the accumulated NTP slew since boot (68 ms and 338 ms seen on WSL at different times, 425 to 451 ms on the GitHub Ubuntu images), so no fixed offset works and a 1 ms check against MONOTONIC alone never passes on a jackd2.
+
+**Verification:** Windows `UnitTestRunner --category=Audio`: suite `JACK processing cycle timestamps` 7 of 7 cases pass, and 7 of 7 on the whole .6 series (Windows, Release, whole run 288 of 288). WSL Ubuntu (ALSA and JACK enabled, jackd2 1.9.22): same suite 7 of 7 after the missing-symbol change (F4); harness `ts-harness jack 20 require-present` against `jackd -d dummy -r 48000 -p 256`: ALL PASS, processingCycle present in 100% of 3750 callbacks, offset 0, flags 0, increasing, cycle time minus callback entry within -0.68 to +0.13 ms, spans within 1% of 48 kHz, `hostTimeNs` null, MONOTONIC - RAW = 68.2 ms printed and applied. Missing symbol: the harness run against a copy of libjack.so.0 with the name `jack_get_cycle_times` byte-edited to `jack_get_cycle_timez` (so `dlsym` fails; copy on `LD_LIBRARY_PATH`, not committed) reports processingCycle present in 0.0% of callbacks.
+
+**Limits:** A libjack predating `jack_get_cycle_times` gets no role. The value is JACK's prediction, not a device or kernel timestamp. A server whose clock matches neither MONOTONIC nor RAW within 1 ms gets no role. Under heavy host overload JACK's prediction itself can step; that is the server's value and is forwarded unchanged.
+
+New in .6. Revised before publication: the first draft checked once per activation that `jack_get_time()` agreed with CLOCK_MONOTONIC within 1 ms, and so left the role absent on every jackd2. Replaced in place by the per-callback rule below (SPEC "JACK clock: ruling 8 replaced").

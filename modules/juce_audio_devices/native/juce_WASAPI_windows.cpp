@@ -1273,7 +1273,6 @@ public:
     bool open (double newSampleRate, const BigInteger& newChannels, int bufferSizeSamples)
     {
         correspondence.reset();
-        hasWrittenBlock = false;
 
         if (! (openClient (newSampleRate, newChannels, bufferSizeSamples)
                 && (numChannels == 0 || check (client->GetService (__uuidof (IAudioRenderClient),
@@ -1309,11 +1308,14 @@ public:
         presentation. Measured on a shared-mode render stream, after the application has run dry
         the position stays put while the engine plays silence of its own and carries on from the
         same place, but its pair no longer matches presentation (the output ends up 8-16 ms off,
-        for the rest of the run). So from the first write, after the first block, that finds the
-        engine's buffer empty, or if a position is ever ahead of the frames released, the clock
-        has counted something that is not in the stream, and the observation is absent until the
-        device is opened again (the first block may find the engine through start()'s silence:
-        that is start-up, forwarded as the clock gives it). The input role is not affected and does not depend on this.
+        for the rest of the run). So from the first write that finds the engine's buffer empty
+        (the first one after start()'s silence included: an engine that has run dry before the
+        application's first block is not presenting that stream), or if a position is ever ahead of
+        the frames released, or if the padding cannot be read, the clock has counted something that
+        is not in the stream, and the observation is absent until the device is opened again.
+        Every padding read before a write goes to the correspondence, in either share mode (in
+        exclusive mode it is read after the event, before the write, for this and nothing else).
+        The input role is not affected and does not depend on this.
 
         Nothing is projected: the observation is the clock's own pair, aligned to the nearest
         frame by getRenderTimestamp.
@@ -1368,26 +1370,31 @@ public:
         return true;
     }
 
-    // In shared mode the padding found here is the one before the write that follows
+    // The engine's padding before the write that follows, for the correspondence; nullopt (and the
+    // correspondence lost) if it cannot be read
+    std::optional<UINT32> readPaddingBeforeWrite()
+    {
+        UINT32 padding = 0;
+
+        if (check (client->GetCurrentPadding (&padding)))
+        {
+            correspondence.paddingBeforeWrite (padding);
+            return padding;
+        }
+
+        correspondence.lose();
+        return {};
+    }
+
+    // Shared mode writes what the engine has room for; exclusive mode the whole buffer, after the event
     int getNumSamplesAvailableToCopy()
     {
         if (numChannels <= 0)
             return 0;
 
         if (! isExclusiveMode (deviceMode))
-        {
-            UINT32 padding = 0;
-
-            if (check (client->GetCurrentPadding (&padding)))
-            {
-                // The first block can find the engine already through start()'s silence, as the
-                // application's first callback is later than that; that is start-up, not a lapse
-                if (hasWrittenBlock)
-                    correspondence.paddingBeforeWrite (padding);
-
-                return (int) actualBufferSize - (int) padding;
-            }
-        }
+            if (const auto padding = readPaddingBeforeWrite())
+                return (int) actualBufferSize - (int) *padding;
 
         return (int) actualBufferSize;
     }
@@ -1418,8 +1425,13 @@ public:
                 break;
             }
 
-            if (isExclusiveMode (deviceMode) && WaitForSingleObject (clientEvent, 1000) == WAIT_TIMEOUT)
-                break;
+            if (isExclusiveMode (deviceMode))
+            {
+                if (WaitForSingleObject (clientEvent, 1000) == WAIT_TIMEOUT)
+                    break;
+
+                readPaddingBeforeWrite();
+            }
 
             const auto numChannelsToCopy = jmin (actualNumChannels, numSrcBuffers);
             jassert (numChannelsToCopy <= channelMaps.size());
@@ -1432,7 +1444,6 @@ public:
 
                 renderClient->ReleaseBuffer ((UINT32) samplesToDo, 0);
                 correspondence.released (samplesToDo);
-                hasWrittenBlock = true;
             }
 
             bufferSize -= samplesToDo;
@@ -1453,7 +1464,6 @@ public:
     ComSmartPtr<IAudioClock> audioClock;
     UINT64 clockFrequency = 0;
     RenderStreamCorrespondence correspondence;
-    bool hasWrittenBlock = false;   // a callback's frames have been released since the device opened
     std::unique_ptr<AudioData::Converter> converter;
 
 private:

@@ -463,10 +463,11 @@ struct AsioClockCandidates
     driverTimesNs: successive system times of the run, oldest first. Needs at least 8. If every one
     is a whole millisecond the only candidate is timeGetTime; otherwise the candidates are QPC and
     interrupt time. A candidate c matches if the newest driver time t has c - maxAgeNs <= t <= c
-    (the driver's time is of a switch that has already happened, at most maxAgeNs earlier). If
-    none matches, nullopt. If QPC and interrupt time both match (they are closer together than
-    maxAgeNs), the clock is taken to be interrupt time; a driver that really uses QPC then has a
-    constant error of at most maxAgeNs.
+    (the driver's time is of a switch that has already happened, at most maxAgeNs earlier). No
+    match gives nullopt. If QPC and interrupt time both match (they are closer together than
+    maxAgeNs, e.g. no sleep since boot), the clock is interrupt time (SPEC "ASIO ambiguous clock"):
+    for a QPC driver the error is the measured |interrupt time - QPC| gap, constant for the run and
+    at most maxAgeNs.
 */
 inline std::optional<int64_t> identifyAsioClockOffset (const int64_t* driverTimesNs, int numDriverTimes,
                                                        const AsioClockCandidates& candidates, int64_t maxAgeNs) noexcept

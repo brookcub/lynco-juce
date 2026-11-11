@@ -707,13 +707,21 @@ public:
             expectOffset (identify (times (now.timeGetTimeNs - 60'000'000, 5'000'000), now, maxAge), std::nullopt);
         }
 
-        beginTest ("No candidate, two candidates, or fewer than 8 times: nothing for the run");
+        beginTest ("QPC and interrupt time both match: interrupt time, whichever is ahead (SPEC \"ASIO ambiguous clock\")");
+        {
+            // interrupt time 20 ms behind QPC: a time 3 ms before interrupt time matches both;
+            // QPC - interrupt time = 20'000'000
+            constexpr AsioClockCandidates behind { 1'000'000'000'000, 999'980'000'000, 999'975'000'000 };
+            expectOffset (identify (times (behind.interruptTimeNs - 3'000'100), behind, maxAge), 20'000'000);
+
+            // interrupt time 10 ms ahead of QPC: a time 3 ms before QPC matches both; -10'000'000
+            constexpr AsioClockCandidates ahead { 1'000'000'000'000, 1'000'010'000'000, 1'000'005'000'000 };
+            expectOffset (identify (times (ahead.qpcNs - 3'000'100), ahead, maxAge), -10'000'000);
+        }
+
+        beginTest ("No candidate, or fewer than 8 times: nothing for the run");
         {
             expectOffset (identify (times (now.qpcNs - 200'000'000'000), now, maxAge), std::nullopt);
-
-            // QPC and interrupt time 20 ms apart: a time 3 ms before interrupt time matches both
-            constexpr AsioClockCandidates close { 1'000'000'000'000, 999'980'000'000, 999'975'000'000 };
-            expectOffset (identify (times (close.interruptTimeNs - 3'000'100), close, maxAge), std::nullopt);
 
             const auto seven = times (now.interruptTimeNs - 3'100'300);
             expectOffset (identifyAsioClockOffset (seven.data() + 1, 7, now, maxAge), std::nullopt);

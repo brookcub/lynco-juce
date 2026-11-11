@@ -377,4 +377,175 @@ private:
     SeqLock<Observation> observations;  // written by read() only
 };
 
+//==============================================================================
+/*  One buffer switch's native pair: from the ASIOTime that bufferSwitchTimeInfo delivers for that
+    switch, or, for a driver that calls the plain bufferSwitch, from ASIOGetSamplePosition (its
+    success sets both valid flags; it has no change flags).
+*/
+struct AsioSwitchTime
+{
+    bool systemTimeValid = false, samplePositionValid = false;   // kSystemTimeValid, kSamplePositionValid
+    uint32_t systemTimeHi = 0, systemTimeLo = 0;                 // ASIOTimeStamp halves: ns on the driver's clock
+    uint32_t samplePositionHi = 0, samplePositionLo = 0;         // ASIOSamples halves: the pair's sample position
+    bool sampleRateChanged = false, clockSourceChanged = false;  // kSampleRateChanged, kClockSourceChanged
+};
+
+/*  The processing-cycle observation of each buffer switch of a run, on the callback thread.
+
+    reset (blockSize) starts a run (open/start); nothing from an earlier run is kept.
+
+    next() is called once for every buffer switch, in order. Both 64-bit values are their two
+    32-bit halves combined as unsigned.
+
+    Block-start bookkeeping (SPEC "Rulings on the prosecution review", F2). The first switch of
+    the run with a valid sample position anchors the tracking: the tracked start, and the newest
+    position seen, are that position. Every later switch advances the tracked start by blockSize;
+    an invalid position still counts as a switch. A valid position p is reconciled with the
+    tracking when it is
+      - not before the newest position seen (a position never goes back),
+      - not after the tracked start (a pair ahead of the tracking cannot be told apart: missed
+        switches, or the next switch's pair read early), and
+      - a whole number of blocks before the tracked start;
+    then sampleOffset = p - tracked start (0 for this switch's own pair, -blockSize for the
+    previous switch's, ...) and p is the newest position seen. A valid position that is not
+    reconciled loses the tracking: that switch has no observation, and the next switch with a
+    valid position anchors the tracking again, as at the start of a run (offset 0). The first
+    observation delivered after a loss carries nativeDiscontinuity, whichever switch delivers it.
+
+    The observation: timeNs = systemTime + clockOffsetNs; sampleOffset as above; nativeFlags =
+    nativeDiscontinuity if sampleRateChanged or clockSourceChanged, or if it is the first
+    observation since a loss, else 0.
+
+    nullopt if the system time or the sample position is not valid, there is no clock offset, no
+    valid position has been seen in this run, or the position is not reconciled.
+
+    Known limit: an anchoring pair is taken to be its own switch's. If it is stale, the offsets
+    are whole blocks too high until a pair ahead of the tracking causes a new anchor.
+
+    Implementers may add private members; the public interface is fixed.
+*/
+class AsioBlockTimes
+{
+public:
+    void reset (int blockSize) noexcept
+    {
+        size = blockSize;
+        start.reset();
+        newest = 0;
+        lost = false;
+    }
+
+    std::optional<AudioIODeviceTimestamp> next (const AsioSwitchTime& switchTime, std::optional<int64_t> clockOffsetNs) noexcept
+    {
+        const auto position = (int64_t) (((uint64_t) switchTime.samplePositionHi << 32) | (uint64_t) switchTime.samplePositionLo);
+
+        if (start.has_value())
+            *start += size;
+
+        int64_t sampleOffset = 0;
+
+        if (switchTime.samplePositionValid)
+        {
+            if (! start.has_value())
+            {
+                start = newest = position;
+            }
+            else if (newest <= position && position <= *start && (*start - position) % size == 0)
+            {
+                sampleOffset = position - *start;
+                newest = position;
+            }
+            else
+            {
+                start.reset();
+                lost = true;
+                return {};
+            }
+        }
+
+        if (! switchTime.systemTimeValid || ! switchTime.samplePositionValid || ! clockOffsetNs.has_value())
+            return {};
+
+        // The halves are unsigned: the low one must not be sign-extended on its way into the sum
+        const auto systemTimeNs = (int64_t) (((uint64_t) switchTime.systemTimeHi << 32) | (uint64_t) switchTime.systemTimeLo);
+        const bool changed = switchTime.sampleRateChanged || switchTime.clockSourceChanged || lost;
+        lost = false;
+
+        return AudioIODeviceTimestamp { systemTimeNs + *clockOffsetNs, sampleOffset,
+                                        changed ? (uint32_t) AudioIODeviceTimestamp::nativeDiscontinuity : 0u };
+    }
+
+private:
+    int size = 0;
+    std::optional<int64_t> start;   // the current block's first frame, in the driver's count
+    int64_t newest = 0;             // the newest position seen
+    bool lost = false;              // tracking was lost; the next delivered observation says so
+};
+
+/*  Three candidate clocks, read back to back at the instant timeGetTime()'s value changes, after
+    the driver times were read: QPC (as Time::getHighResolutionTicks() in ns), interrupt time
+    (QueryInterruptTimePrecise x 100) and timeGetTime() x 1'000'000, all in ns.
+*/
+struct AsioClockCandidates
+{
+    int64_t qpcNs, interruptTimeNs, timeGetTimeNs;
+};
+
+/*  Identifies the driver's systemTime clock once per run and returns the offset to add to it to
+    reach the QPC timeline (candidates.qpcNs - the matching candidate), or nullopt (the role is
+    absent for the run).
+
+    driverTimesNs: successive system times of the run, oldest first. Needs at least 8. If every one
+    is a whole millisecond the only candidate is timeGetTime; otherwise the candidates are QPC and
+    interrupt time. A candidate c matches if the newest driver time t has c - maxAgeNs <= t <= c
+    (the driver's time is of a switch that has already happened, at most maxAgeNs earlier). No
+    match gives nullopt. If QPC and interrupt time both match (they are closer together than
+    maxAgeNs, e.g. no sleep since boot), the clock is interrupt time (SPEC "ASIO ambiguous clock"):
+    for a QPC driver the error is the measured |interrupt time - QPC| gap, constant for the run and
+    at most maxAgeNs.
+*/
+inline std::optional<int64_t> identifyAsioClockOffset (const int64_t* driverTimesNs, int numDriverTimes,
+                                                       const AsioClockCandidates& candidates, int64_t maxAgeNs) noexcept
+{
+    if (numDriverTimes < 8)
+        return {};
+
+    const auto newest = driverTimesNs[numDriverTimes - 1];
+    const auto allWholeMilliseconds = std::all_of (driverTimesNs, driverTimesNs + numDriverTimes,
+                                                   [] (int64_t t) { return t % 1'000'000 == 0; });
+
+    const auto matches = [&] (int64_t candidate) { return candidate - maxAgeNs <= newest && newest <= candidate; };
+
+    if (allWholeMilliseconds)
+        return matches (candidates.timeGetTimeNs) ? std::optional<int64_t> (candidates.qpcNs - candidates.timeGetTimeNs) : std::nullopt;
+
+    // Interrupt time first: if QPC matches as well (the two are closer than maxAgeNs), the driver's
+    // clock is taken to be interrupt time, and a QPC driver then has a constant error of the gap
+    if (matches (candidates.interruptTimeNs))
+        return candidates.qpcNs - candidates.interruptTimeNs;
+
+    return matches (candidates.qpcNs) ? std::optional<int64_t> (0) : std::nullopt;
+}
+
+/*  A timeGetTime clock (identifyAsioClockOffset found every time a whole millisecond) is a 32-bit
+    millisecond count x 1'000'000, so a driver's system time on it falls back to 0 after 2^32 ms
+    (49.7 days of uptime). Returns driverTimeNs plus the whole number of 2^32 ms periods that puts
+    it within half a period (2^31 ms) of referenceNs: the count continued exactly across any
+    number of wraps, with no estimate (SPEC "Rulings on the prosecution review", F5).
+
+    referenceNs is the previous switch's unwrapped time; for the first switch after an
+    identification, the timeGetTimeNs candidate it was identified against (the clock offset is
+    relative to that candidate's own value). Only for a timeGetTime clock: QPC and interrupt time
+    are 64-bit counts.
+*/
+inline int64_t unwrapTimeGetTimeNs (int64_t driverTimeNs, int64_t referenceNs) noexcept
+{
+    constexpr int64_t period = (int64_t) 1 << 32;                      // ms
+    constexpr int64_t periodNs = period * 1'000'000;
+    const auto diff = referenceNs - driverTimeNs;                      // floor((diff + half) / period) periods, exactly
+    const auto k = (diff + periodNs / 2) >= 0 ? (diff + periodNs / 2) / periodNs
+                                              : -((-(diff + periodNs / 2) + periodNs - 1) / periodNs);
+    return driverTimeNs + k * periodNs;
+}
+
 } // namespace juce::CallbackTimeHelpers

@@ -103,6 +103,13 @@ struct AudioIODeviceTimestamp
     |                        | the packet holding the callback's first real      | reported time (observation)                        |                           |
     |                        | sample (observation)                              |                                                    |                           |
     | Oboe (AAudio, API 30+) | getTimestamp: a frame entering the pipeline       | getTimestamp: a frame leaving the pipeline         | -                         |
+    | ASIO                   | -                                                 | -                                                  | the buffer switch's       |
+    |                        |                                                   |                                                    | (samplePosition,          |
+    |                        |                                                   |                                                    | systemTime) pair, at that |
+    |                        |                                                   |                                                    | position's offset from    |
+    |                        |                                                   |                                                    | the block's start: 0 for  |
+    |                        |                                                   |                                                    | its own pair, -blockSize  |
+    |                        |                                                   |                                                    | for the previous one's    |
     | all others             | -                                                 | -                                                  | -                         |
 
     An observation never crosses a stop: audioDeviceAboutToStart and audioDeviceStopped

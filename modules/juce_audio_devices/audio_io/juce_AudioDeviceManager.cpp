@@ -1784,10 +1784,18 @@ public:
             manager.removeAudioCallback (&callback);
         }
 
-        beginTest ("A callback longer than the buffer size is split, and each block gets the time of its own first sample");
+        // Acceptance tests for P008.1 (the enforcer's split blocks). Builders do not edit them.
+        // A split block that starts k samples into the device's callback sees each role's
+        // observation unchanged in time and flags, with its offset k smaller; the expected offsets
+        // below are that subtraction, worked by hand. hostTimeNs is upstream JUCE 8.0.12's: the
+        // enforcer passed the device's context to every block unchanged.
+
+        beginTest ("A split callback keeps each role's time and flags, and moves each offset by its block's start");
         {
-            // 512 samples at 48 kHz last 10,666,666.67 ns
-            const auto blocks = deliverOneCallback (48000.0, 512, 1024, 5'000'000'000u, 4'990'000'000u);
+            const AudioIODeviceTimestamp input  { 4'990'000'000, -96, 0 };
+            const AudioIODeviceTimestamp output { 5'004'000'000, 300, AudioIODeviceTimestamp::nativeReducedAccuracy };
+            const AudioIODeviceTimestamp cycle  { 0, 0, AudioIODeviceTimestamp::nativeDiscontinuity };
+            const auto blocks = deliverOneCallback (48000.0, 512, 1024, { nullptr, &input, &output, &cycle });
 
             expectEquals ((int) blocks.size(), 2);
 
@@ -1796,64 +1804,80 @@ public:
                 expectEquals (blocks[0].numSamples, 512);
                 expectEquals (blocks[1].numSamples, 512);
 
-                expect (blocks[0].host  == 5'000'000'000u);
-                expect (blocks[0].input == 4'990'000'000u);
-                expect (blocks[1].host  == 5'010'666'667u);
-                expect (blocks[1].input == 5'000'666'667u);
+                expectTimestamp (blocks[0].input,  AudioIODeviceTimestamp { 4'990'000'000, -96, 0 });
+                expectTimestamp (blocks[0].output, AudioIODeviceTimestamp { 5'004'000'000, 300, AudioIODeviceTimestamp::nativeReducedAccuracy });
+                expectTimestamp (blocks[0].cycle,  AudioIODeviceTimestamp { 0, 0, AudioIODeviceTimestamp::nativeDiscontinuity });
+
+                expectTimestamp (blocks[1].input,  AudioIODeviceTimestamp { 4'990'000'000, -608, 0 });
+                expectTimestamp (blocks[1].output, AudioIODeviceTimestamp { 5'004'000'000, -212, AudioIODeviceTimestamp::nativeReducedAccuracy });
+                expectTimestamp (blocks[1].cycle,  AudioIODeviceTimestamp { 0, -512, AudioIODeviceTimestamp::nativeDiscontinuity });
             }
         }
 
-        beginTest ("A split callback without times passes no times to any block");
+        beginTest ("Every block of a split keeps the time, at any sample rate and with a short last block");
         {
-            const auto blocks = deliverOneCallback (48000.0, 512, 1024, std::nullopt, std::nullopt);
-
-            expectEquals ((int) blocks.size(), 2);
-
-            for (const auto& block : blocks)
-            {
-                expect (! block.host.has_value());
-                expect (! block.input.has_value());
-            }
-        }
-
-        beginTest ("A split callback with only one of the two times keeps the other null");
-        {
-            const auto onlyHost = deliverOneCallback (48000.0, 512, 1024, 5'000'000'000u, std::nullopt);
-            expectEquals ((int) onlyHost.size(), 2);
-
-            if (onlyHost.size() == 2)
-            {
-                expect (onlyHost[0].host == 5'000'000'000u);
-                expect (onlyHost[1].host == 5'010'666'667u);
-                expect (! onlyHost[0].input.has_value());
-                expect (! onlyHost[1].input.has_value());
-            }
-
-            const auto onlyInput = deliverOneCallback (48000.0, 512, 1024, std::nullopt, 4'990'000'000u);
-            expectEquals ((int) onlyInput.size(), 2);
-
-            if (onlyInput.size() == 2)
-            {
-                expect (! onlyInput[0].host.has_value());
-                expect (! onlyInput[1].host.has_value());
-                expect (onlyInput[0].input == 4'990'000'000u);
-                expect (onlyInput[1].input == 5'000'666'667u);
-            }
-        }
-
-        beginTest ("The time of a split block is rounded to the nearest nanosecond");
-        {
-            // 512 / 44100 s = 11,609,977.32... ns and 1024 / 44100 s = 23,219,954.64... ns
-            const auto at44100 = deliverOneCallback (44100.0, 512, 1536, 1'000'000'000u, 1'000'000'000u);
+            // No time is advanced by a block's duration, so the sample rate plays no part
+            const AudioIODeviceTimestamp output { 1'000'000'000, 0, 0 };
+            const auto at44100 = deliverOneCallback (44100.0, 512, 1500, { nullptr, nullptr, &output, nullptr });
             expectEquals ((int) at44100.size(), 3);
 
             if (at44100.size() == 3)
             {
-                expect (at44100[0].host == 1'000'000'000u);
-                expect (at44100[1].host == 1'011'609'977u);
-                expect (at44100[2].host == 1'023'219'955u);
-                expect (at44100[1].input == 1'011'609'977u);
-                expect (at44100[2].input == 1'023'219'955u);
+                expectEquals (at44100[2].numSamples, 476);
+                expectTimestamp (at44100[0].output, AudioIODeviceTimestamp { 1'000'000'000, 0, 0 });
+                expectTimestamp (at44100[1].output, AudioIODeviceTimestamp { 1'000'000'000, -512, 0 });
+                expectTimestamp (at44100[2].output, AudioIODeviceTimestamp { 1'000'000'000, -1024, 0 });
+            }
+        }
+
+        beginTest ("A role without an observation has none in any block, whatever the other roles have");
+        {
+            const AudioIODeviceTimestamp input { 7'000'000'000, 12, 0 };
+            const auto blocks = deliverOneCallback (48000.0, 512, 1024, { nullptr, &input, nullptr, nullptr });
+            expectEquals ((int) blocks.size(), 2);
+
+            for (const auto& block : blocks)
+            {
+                expect (! block.output.has_value());
+                expect (! block.cycle.has_value());
+            }
+
+            if (blocks.size() == 2)
+                expectTimestamp (blocks[1].input, AudioIODeviceTimestamp { 7'000'000'000, -500, 0 });
+
+            const auto none = deliverOneCallback (48000.0, 512, 1024, {});
+            expectEquals ((int) none.size(), 2);
+
+            for (const auto& block : none)
+                expect (! block.host.has_value() && ! block.input.has_value() && ! block.output.has_value() && ! block.cycle.has_value());
+        }
+
+        beginTest ("hostTimeNs reaches every block of a split unchanged, as upstream passes it");
+        {
+            const uint64_t host = 5'000'000'000;
+            const AudioIODeviceTimestamp output { 5'004'000'000, 0, 0 };
+            const auto blocks = deliverOneCallback (48000.0, 512, 1536, { &host, nullptr, &output, nullptr });
+            expectEquals ((int) blocks.size(), 3);
+
+            for (const auto& block : blocks)
+                expect (block.host == 5'000'000'000u, "got " + (block.host.has_value() ? String (*block.host) : String ("none")));
+
+            if (blocks.size() == 3)
+                expectTimestamp (blocks[2].output, AudioIODeviceTimestamp { 5'004'000'000, -1024, 0 });
+        }
+
+        beginTest ("A callback that is not split passes its observations and hostTimeNs unchanged");
+        {
+            const uint64_t host = 3'000'000'000;
+            const AudioIODeviceTimestamp input { 2'990'000'000, -64, AudioIODeviceTimestamp::nativeTimestampError };
+            const auto blocks = deliverOneCallback (48000.0, 512, 512, { &host, &input, nullptr, nullptr });
+            expectEquals ((int) blocks.size(), 1);
+
+            if (blocks.size() == 1)
+            {
+                expect (blocks[0].host == 3'000'000'000u);
+                expectTimestamp (blocks[0].input, AudioIODeviceTimestamp { 2'990'000'000, -64, AudioIODeviceTimestamp::nativeTimestampError });
+                expect (! blocks[0].output.has_value());
             }
         }
     }
@@ -2208,7 +2232,8 @@ private:
     struct BlockTimes
     {
         int numSamples = 0;
-        std::optional<uint64_t> host, input;
+        std::optional<uint64_t> host;
+        std::optional<AudioIODeviceTimestamp> input, output, cycle;
     };
 
     class TimeRecorder final : public AudioIODeviceCallback
@@ -2223,15 +2248,14 @@ private:
                                                int numSamples,
                                                const AudioIODeviceCallbackContext& context) override
         {
+            const auto copy = [] (const AudioIODeviceTimestamp* t) { return t != nullptr ? std::optional (*t) : std::nullopt; };
+
             BlockTimes block;
             block.numSamples = numSamples;
-
-            if (context.hostTimeNs != nullptr)
-                block.host = *context.hostTimeNs;
-
-            if (context.inputHostTimeNs != nullptr)
-                block.input = *context.inputHostTimeNs;
-
+            block.host = context.hostTimeNs != nullptr ? std::optional (*context.hostTimeNs) : std::nullopt;
+            block.input = copy (context.inputStream);
+            block.output = copy (context.outputStream);
+            block.cycle = copy (context.processingCycle);
             blocks.push_back (block);
         }
 
@@ -2239,13 +2263,24 @@ private:
         void audioDeviceStopped() override {}
     };
 
+    void expectTimestamp (const std::optional<AudioIODeviceTimestamp>& actual, const AudioIODeviceTimestamp& expected)
+    {
+        const auto describe = [] (const AudioIODeviceTimestamp& t)
+        {
+            return "{ " + String (t.timeNs) + " ns, offset " + String (t.sampleOffset) + ", flags " + String (t.nativeFlags) + " }";
+        };
+
+        expect (actual.has_value() && actual->timeNs == expected.timeNs && actual->sampleOffset == expected.sampleOffset
+                    && actual->nativeFlags == expected.nativeFlags,
+                "got " + (actual.has_value() ? describe (*actual) : String ("absent")) + ", expected " + describe (expected));
+    }
+
     // Opens a mock device with the given buffer size, has it make one callback of numSamples
-    // with the given times, and returns what the AudioDeviceManager's client saw of it.
+    // with the given context, and returns what the AudioDeviceManager's client saw of it.
     std::vector<BlockTimes> deliverOneCallback (double sampleRate,
                                                 int bufferSize,
                                                 int numSamples,
-                                                std::optional<uint64_t> hostTime,
-                                                std::optional<uint64_t> inputHostTime)
+                                                const AudioIODeviceCallbackContext& context)
     {
         AudioDeviceManager manager;
         manager.addAudioDeviceType (std::make_unique<MockDeviceType> ("foo",
@@ -2265,15 +2300,9 @@ private:
         manager.addAudioCallback (&recorder);
 
         if (auto* device = dynamic_cast<MockDevice*> (manager.getCurrentAudioDevice()))
-        {
-            const AudioIODeviceCallbackContext context { hostTime ? &*hostTime : nullptr,
-                                                         inputHostTime ? &*inputHostTime : nullptr };
             device->deliver (numSamples, context);
-        }
         else
-        {
             expect (false);
-        }
 
         manager.removeAudioCallback (&recorder);
         return recorder.blocks;

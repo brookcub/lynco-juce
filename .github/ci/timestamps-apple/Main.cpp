@@ -12,7 +12,7 @@ namespace
 {
     struct Record
     {
-        int numSamples = 0;
+        int numSamples = 0, xruns = 0;
         bool hasHost = false, hasInput = false, hasOutput = false, hasCycle = false;
         int64_t inTime = 0, inOffset = 0, outTime = 0, outOffset = 0;
         uint32_t outFlags = 0;
@@ -43,6 +43,7 @@ namespace
             {
                 auto& r = records[(size_t) i];
                 r.numSamples = n;
+                r.xruns = device->getXRunCount();    // read after the context was built
                 r.hasHost = context.hostTimeNs != nullptr;
                 r.hasInput = context.inputStream != nullptr;
                 r.hasOutput = context.outputStream != nullptr;
@@ -60,6 +61,7 @@ namespace
             }
         }
 
+        AudioIODevice* device = nullptr;    // the combiner; its xrun count is atomic
         std::vector<Record> records;
         std::atomic<int> count { 0 }, blockedAt { -1 };
     };
@@ -126,6 +128,7 @@ int main()
            "both directions have active channels");
 
     Recorder recorder;
+    recorder.device = device;
     manager.addAudioCallback (&recorder);
     MessageManager::getInstance()->runDispatchLoopUntil (runSeconds * 1000);
     manager.removeAudioCallback (&recorder);
@@ -153,8 +156,69 @@ int main()
     const auto counted = total - skip;
     std::cout << "after 1 s: input " << withInput << ", output " << withOutput << ", cycle " << withCycle << ", host " << withHost << " of " << counted << std::endl;
     check (withInput >= counted * 0.99, "inputStream present in >= 99% of callbacks");
-    check (withOutput >= counted * 0.90, "outputStream present in >= 90% of callbacks");
     check (withCycle == 0, "processingCycle is never present");
+
+    // outputStream presence, independent of how many xruns the runner produces. An xrun resets the
+    // correspondence; it is re-established once the output device has read, and stamped, a frame
+    // written after the reset. The FIFO holds targetLatency + 2 buffers, and the writer cannot get
+    // further ahead than that without another xrun, so the first new frame is read within
+    // ceil (fifo / n) app callbacks of being written. Window = that + 4 callbacks: re-initialising
+    // each side (2), a first read that starts on padding gives nothing (1), the read is seen by the
+    // next app callback (1). Every callback outside such a window must have the role. The window
+    // is excused on both sides of the count change: the count is read after the context was built,
+    // so a reset can precede the callback that first shows it.
+    const auto fifoFrames = device->getInputLatencyInSamples() + device->getOutputLatencyInSamples() + 2 * bufferSize;
+    const int window = (fifoFrames + bufferSize - 1) / bufferSize + 4;
+    int excused = 0, required = 0, missing = 0;
+    for (int i = skip; i < total; ++i)
+    {
+        const auto from = std::max (0, i - window - 1), to = std::min (total - 1, i + 1);
+        if (r[(size_t) to].xruns != r[(size_t) from].xruns) { ++excused; continue; }
+        ++required;
+        if (! r[(size_t) i].hasOutput && missing++ < 5)
+            std::cout << "  outputStream missing at " << i << " (xruns " << r[(size_t) i].xruns << ")" << std::endl;
+    }
+    std::cout << "re-establishment window " << window << " callbacks (fifo " << fifoFrames << " frames); excused "
+              << excused << ", required " << required << ", missing " << missing << std::endl;
+    check (required >= (int) (sampleRate / bufferSize), "at least 1 s of callbacks lie outside xrun windows");
+    check (missing == 0, "outputStream present in every callback outside an xrun's re-establishment window");
+
+    // inputStream: the app callback runs inside the input device's callback, so the stamp names a
+    // frame of this buffer (offset 0, or -k for a chunk at k), and across xrun-free stretches of at
+    // least 1 s its time advances with the frames delivered at 48 kHz within 1 %.
+    {
+        bool offsetsOk = true;
+        int inSpans = 0, inBad = 0;
+        int64_t cumulative = 0;
+        std::vector<int64_t> first ((size_t) total);
+        for (int i = 0; i < total; ++i) { first[(size_t) i] = cumulative; cumulative += r[(size_t) i].numSamples; }
+
+        for (int i = skip; i < total; ++i)
+            offsetsOk = offsetsOk && (! r[(size_t) i].hasInput || r[(size_t) i].inOffset <= 0);
+
+        for (int i = skip; i < total;)
+        {
+            int j = i + 1;
+            while (j < total && r[(size_t) j].hasInput && r[(size_t) j].xruns == r[(size_t) i].xruns
+                   && r[(size_t) j].inTime - r[(size_t) i].inTime < 1'000'000'000)
+                ++j;
+
+            if (j < total && r[(size_t) i].hasInput && r[(size_t) j].hasInput && r[(size_t) j].xruns == r[(size_t) i].xruns)
+            {
+                const auto frames = (double) ((first[(size_t) j] + r[(size_t) j].inOffset) - (first[(size_t) i] + r[(size_t) i].inOffset));
+                const auto rate = frames / ((double) (r[(size_t) j].inTime - r[(size_t) i].inTime) * 1e-9);
+                ++inSpans;
+                if (std::abs (rate - sampleRate) > sampleRate * 0.01 && inBad++ < 5)
+                    std::cout << "  input span " << i << " to " << j << ": " << rate << " frames/s" << std::endl;
+            }
+
+            i = j;
+        }
+
+        std::cout << "input 1 s spans: " << inSpans << ", off by more than 1%: " << inBad << std::endl;
+        check (offsetsOk, "inputStream offsets are <= 0");
+        check (inSpans >= 5 && inBad == 0, "inputStream time and frames agree with 48 kHz within 1% over xrun-free 1 s spans");
+    }
 
     // While an observation repeats, its offset falls by the previous callback's numSamples
     int repeats = 0, badRepeats = 0;
@@ -236,7 +300,14 @@ int main()
             }
         }
         std::cout << "after the block at " << blocked << ": absent in " << absent << " callbacks, first at " << firstAbsent << ", returned at " << returned << std::endl;
-        check (absent >= 1, "outputStream is absent for at least one callback after the xrun");
+
+        // Blocking the input device's callback for 200 ms underruns the FIFO, which resets the
+        // correspondence. The blocked callback's own write is then dropped, and the next callback's
+        // write comes after its context is built, so that callback has no frame written since the
+        // reset and cannot have an observation. (Background xruns make "absent somewhere later"
+        // vacuous; this one is not.)
+        check (blocked + 1 < total && r[(size_t) blocked + 1].xruns > r[(size_t) blocked].xruns, "the block produced an xrun");
+        check (blocked + 1 < total && ! r[(size_t) blocked + 1].hasOutput, "outputStream is absent in the callback right after the block");
         check (returned > firstAbsent && firstAbsent >= 0, "outputStream returns after the xrun");
     }
     else

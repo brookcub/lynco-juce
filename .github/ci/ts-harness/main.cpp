@@ -2,13 +2,16 @@
 // device through AudioDeviceManager, records the callback context of every callback, and checks
 // the RAILS.md P022/P023 assertions.
 //
-//   ts-harness jack  <seconds>
-//   ts-harness alsa  <outputNameSubstring> <inputNameSubstring> <seconds>
+//   ts-harness jack  <seconds> [require-present|require-absent]
+//   ts-harness alsa  <outputNameSubstring> <inputNameSubstring> <seconds> [present <outHwParams> <inHwParams> | absent]
 //   ts-harness list
 #include <juce_audio_devices/juce_audio_devices.h>
 #include <cmath>
 #include <cstdio>
 #include <ctime>
+#include <dlfcn.h>
+#include <fstream>
+#include <string>
 
 using namespace juce;
 
@@ -19,6 +22,13 @@ struct Rec
     bool hostNull, inP, outP, cycP;
     AudioIODeviceTimestamp in, out, cyc;
 };
+
+static int64_t clockNs (clockid_t id)
+{
+    timespec t;
+    clock_gettime (id, &t);
+    return (int64_t) t.tv_sec * 1'000'000'000 + t.tv_nsec;
+}
 
 struct Recorder final : AudioIODeviceCallback
 {
@@ -39,10 +49,8 @@ struct Recorder final : AudioIODeviceCallback
         if (! recording || recs.size() == recs.capacity())
             return;
 
-        timespec t;
-        clock_gettime (CLOCK_MONOTONIC, &t);
         Rec r {};
-        r.nowNs = (int64_t) t.tv_sec * 1'000'000'000 + t.tv_nsec;
+        r.nowNs = clockNs (CLOCK_MONOTONIC);
         r.numSamples = n;
         r.hostNull = c.hostTimeNs == nullptr;
         if ((r.inP = c.inputStream != nullptr))       r.in = *c.inputStream;
@@ -78,6 +86,41 @@ static String find (AudioIODeviceType& t, bool input, const String& sub)
     return {};
 }
 
+// The expectation for the JACK processingCycle role, decided here and not by the backend (SPEC
+// ruling 8): present iff jack_get_time() agrees with CLOCK_MONOTONIC within 1 ms. Read while the
+// device is open, so libjack is loaded and initialised. 1 = present, 0 = absent, -1 = within
+// 0.5..2 ms of the boundary, too close to decide (no presence assertion).
+static int jackClockExpectation()
+{
+    auto* lib = dlopen ("libjack.so.0", RTLD_NOW | RTLD_NOLOAD);
+    auto* getTime = lib != nullptr ? (uint64_t (*)()) dlsym (lib, "jack_get_time") : nullptr;
+
+    if (getTime == nullptr) { std::printf ("clock: jack_get_time not found\n"); return -1; }
+
+    const auto before = clockNs (CLOCK_MONOTONIC);
+    const auto jackNs = (int64_t) getTime() * 1000;
+    const auto after = clockNs (CLOCK_MONOTONIC);
+    const auto raw = clockNs (CLOCK_MONOTONIC_RAW);
+    const auto outside = jackNs < before ? before - jackNs : (jackNs > after ? jackNs - after : 0);
+
+    std::printf ("clock: jack_get_time - CLOCK_MONOTONIC = %lld ns; CLOCK_MONOTONIC - CLOCK_MONOTONIC_RAW = %lld ns\n",
+                 (long long) (jackNs - (before + after) / 2), (long long) (after - raw));
+
+    if (outside <= 500'000)    return 1;
+    if (outside >= 2'000'000)  return 0;
+    return -1;
+}
+
+// "buffer_size: N" from /proc/asound/.../hw_params of an open substream; 0 if unreadable
+static int64_t ringFrames (const char* hwParamsPath)
+{
+    std::ifstream f (hwParamsPath);
+    for (std::string line; std::getline (f, line);)
+        if (line.rfind ("buffer_size:", 0) == 0)
+            return std::stoll (line.substr (12));
+    return 0;
+}
+
 int main (int argc, char** argv)
 {
     ScopedJuceInitialiser_GUI init;
@@ -89,6 +132,7 @@ int main (int argc, char** argv)
 
     const bool jack = mode == "jack";
     const double seconds = std::atof (argv[jack ? 2 : 4]);
+    const String expectation = argc > (jack ? 3 : 5) ? argv[jack ? 3 : 5] : (jack ? "" : "present");
 
     AudioIODeviceType* type = nullptr;
     for (auto* t : manager.getAvailableDeviceTypes())
@@ -124,10 +168,17 @@ int main (int argc, char** argv)
     auto err = manager.setAudioDeviceSetup (setup, true);
     if (err.isNotEmpty()) { std::printf ("setup error: %s\n", err.toRawUTF8()); return 2; }
     auto* dev = manager.getCurrentAudioDevice();
+    if (dev == nullptr || setup.inputDeviceName.isEmpty() || setup.outputDeviceName.isEmpty()) { std::printf ("FAIL  no such device\n"); return 2; }
     std::printf ("device \"%s\" type %s rate %g buffer %d\n", dev->getName().toRawUTF8(),
                  dev->getTypeName().toRawUTF8(), dev->getCurrentSampleRate(), dev->getCurrentBufferSizeSamples());
 
     Thread::sleep (1000);
+
+    const int jackExpected = jack ? jackClockExpectation() : -1;
+    const bool alsaPresent = ! jack && expectation == "present";
+    const int64_t outRing = alsaPresent && argc > 6 ? ringFrames (argv[6]) : 0;
+    const int64_t inRing  = alsaPresent && argc > 7 ? ringFrames (argv[7]) : 0;
+
     rec.recording = true;
     Thread::sleep ((int) (seconds * 1000));
     rec.recording = false;
@@ -177,60 +228,79 @@ int main (int argc, char** argv)
         check (tested > 0 && bad == 0, String (name) + ": time/offset spans agree with 48 kHz within 1% (" + String (tested) + " spans, " + String (bad) + " bad)");
     };
 
-    const String expectation = argc > (jack ? 3 : 5) ? argv[jack ? 3 : 5] : "present";
-    const bool expectAbsent = expectation == "absent" || (expectation == "auto" && cycP == 0);
-
-    if (! jack && expectAbsent)
+    if (! jack && expectation == "absent")
     {
         check (inP == 0 && outP == 0, "inputStream/outputStream absent in every callback (plugin devices)");
         check (cycP == 0, "processingCycle absent");
     }
-    else if (jack && expectAbsent)
-    {
-        check (cycP == 0, "processingCycle absent in every callback (the server's clock is not CLOCK_MONOTONIC)");
-        check (inP == 0 && outP == 0, "inputStream/outputStream absent");
-    }
     else if (jack)
     {
-        check (cycP >= 0.99 * N, "processingCycle present in >= 99% of callbacks");
-        bool offsetsZero = true, increasing = true, nearNow = true, spacing = true;
-        int inRoles = 0, nonInc = 0, catchUp = 0;
-        for (size_t i = 0; i < r.size(); ++i)
+        // The run must exercise the path the workflow names; which path applies is the clock's call
+        std::printf ("clock decides: %s\n", jackExpected == 1 ? "present" : jackExpected == 0 ? "absent" : "undecided");
+        if (expectation == "require-present") check (jackExpected == 1, "the clocks agree, so this run exercises the present path");
+        if (expectation == "require-absent")  check (jackExpected == 0, "the clocks disagree, so this run exercises the absent path");
+
+        check (inP == 0 && outP == 0, "inputStream/outputStream absent");
+
+        if (jackExpected == 0)
+            check (cycP == 0, "processingCycle absent in every callback (jack_get_time is not CLOCK_MONOTONIC)");
+        else if (jackExpected == 1)
+            check (cycP >= 0.99 * N, "processingCycle present in >= 99% of callbacks");
+
+        if (cycP > 0)
         {
-            inRoles += r[i].inP || r[i].outP;
-            if (! r[i].cycP) continue;
-            offsetsZero = offsetsZero && r[i].cyc.sampleOffset == 0 && r[i].cyc.nativeFlags == 0;
-            nearNow = nearNow && std::abs (r[i].cyc.timeNs - r[i].nowNs) < 100'000'000;
-            if (i > 0 && r[i - 1].cycP)
+            bool offsetsZero = true, increasing = true, nearNow = true, precedesEntry = true;
+            int repeats = 0;
+            int64_t minLead = INT64_MAX, maxLead = INT64_MIN;
+            for (size_t i = 0; i < r.size(); ++i)
             {
-                const auto d = r[i].cyc.timeNs - r[i - 1].cyc.timeNs;
-                // Two callbacks less than 1 ms apart are JACK catching up after a stalled cycle (a
-                // non-real-time host); its cycle time has not moved between them, which is its value.
-                increasing = increasing && (d > 0 || r[i].nowNs - r[i - 1].nowNs < 1'000'000);
-                if (d <= 0) ++catchUp;
-                if (d <= 0 && ++nonInc < 6) std::printf ("   non-increasing at %zu: d=%lld ns, now-delta %lld\n", i, (long long) d, (long long) (r[i].nowNs - r[i - 1].nowNs));
-                spacing = spacing && std::abs ((double) d * 1e-9 - n / rate) < 0.01 * (n / rate) * 20; // per-callback tolerance is loose; spans below are the 1 % check
+                if (! r[i].cycP) continue;
+                offsetsZero = offsetsZero && r[i].cyc.sampleOffset == 0 && r[i].cyc.nativeFlags == 0;
+                nearNow = nearNow && std::abs (r[i].cyc.timeNs - r[i].nowNs) < 100'000'000;
+
+                // The current cycle began before this callback was entered (same clock): kills a
+                // next-cycle time, which lies about one period ahead. Margin: see the review.
+                const auto lead = r[i].cyc.timeNs - r[i].nowNs;
+                minLead = std::min (minLead, lead);
+                maxLead = std::max (maxLead, lead);
+                precedesEntry = precedesEntry && lead <= 1'000'000;
+
+                if (i > 0 && r[i - 1].cycP)
+                {
+                    const auto d = r[i].cyc.timeNs - r[i - 1].cyc.timeNs;
+                    // An exact repeat less than 1 ms after the previous callback is tolerated (a
+                    // catch-up read of an unchanged cycle time); time never runs backwards.
+                    const bool repeat = d == 0 && r[i].nowNs - r[i - 1].nowNs < 1'000'000;
+                    increasing = increasing && (d > 0 || repeat);
+                    repeats += repeat;
+                    if (d <= 0 && ! repeat) std::printf ("   non-increasing at %zu: d=%lld ns, now-delta %lld\n", i, (long long) d, (long long) (r[i].nowNs - r[i - 1].nowNs));
+                }
             }
+            std::printf ("cycle time - callback entry: min %lld ns, max %lld ns\n", (long long) minLead, (long long) maxLead);
+            check (offsetsZero, "processingCycle offset is always 0 and flags 0");
+            check (increasing, "processingCycle times strictly increase (" + String (repeats) + " exact catch-up repeats < 1 ms apart)");
+            check (nearNow, "processingCycle.timeNs within 100 ms of CLOCK_MONOTONIC at callback entry");
+            check (precedesEntry, "processingCycle.timeNs is not after callback entry (1 ms margin)");
+            spans ([] (const Rec& x) { return x.cycP; }, [] (const Rec& x) { return x.cyc; }, false, "cycle");
         }
-        check (offsetsZero, "processingCycle offset is always 0 and flags 0");
-        check (increasing, "processingCycle times strictly increase (" + String (catchUp) + " catch-up repeats < 1 ms apart)");
-        check (nearNow, "processingCycle.timeNs within 100 ms of CLOCK_MONOTONIC at callback entry");
-        check (inRoles == 0, "inputStream/outputStream absent");
-        // successive cycles: 1 % over 1 s spans
-        spans ([] (const Rec& x) { return x.cycP; }, [] (const Rec& x) { return x.cyc; }, false, "cycle");
     }
     else
     {
+        // Offsets from the backend's definition (getAlsaTimestamp): output = avail - ring, in
+        // [-ring, 0]; input = numSamples + avail, in [numSamples, numSamples + ring]. The ring is
+        // the PCM's own buffer_size, read from /proc while the device was open.
+        std::printf ("ring: out %lld in %lld\n", (long long) outRing, (long long) inRing);
+        check (outRing > 0 && inRing > 0, "ring sizes read from hw_params");
         check (inP >= 0.99 * N && outP >= 0.99 * N, "both roles present in >= 99% of callbacks");
         check (cycP == 0, "processingCycle absent");
         bool outOk = true, inOk = true;
         for (auto& x : r)
         {
-            if (x.outP) outOk = outOk && x.out.sampleOffset < 0 && x.out.sampleOffset > -4 * n * 4;
-            if (x.inP)  inOk  = inOk  && x.in.sampleOffset >= 0 && x.in.sampleOffset <= 4 * n * 4;
+            if (x.outP) outOk = outOk && x.out.sampleOffset >= -outRing && x.out.sampleOffset <= 0;
+            if (x.inP)  inOk  = inOk  && x.in.sampleOffset >= x.numSamples && x.in.sampleOffset <= x.numSamples + inRing;
         }
-        check (outOk, "output offsets in (-ring, 0)");
-        check (inOk, "input offsets in [0, ring]");
+        check (outOk, "output offsets in [-ring, 0]");
+        check (inOk, "input offsets in [numSamples, numSamples + ring]");
         spans ([] (const Rec& x) { return x.outP; }, [] (const Rec& x) { return x.out; }, true, "output");
         spans ([] (const Rec& x) { return x.inP; },  [] (const Rec& x) { return x.in; },  true, "input");
     }

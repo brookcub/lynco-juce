@@ -22,11 +22,16 @@ jobs:
       - name: Warnings in the files this branch changes
         run: grep -E "warning:" build.log | grep -E "juce_CoreAudio_mac|juce_CallbackTimeHelpers" || true
       - name: Run the Audio tests
+        shell: bash
         run: |
           app=$(find build -name UnitTestRunner -type f -perm -u+x | head -n 1)
           if [ -z "$app" ]; then app=$(find build -path '*UnitTestRunner.app/Contents/MacOS/UnitTestRunner' | head -n 1); fi
           echo "Running $app"
-          "$app" --category=Audio
+          "$app" --category=Audio | tee utr.log
+          # The suites must have run (a suite compiled out would pass vacuously)
+          test "$(grep -c '^Completed tests in Callback timestamp alignment' utr.log)" -eq 9
+          test "$(grep -c '^Completed tests in CoreAudio chunk timestamps' utr.log)" -eq 6
+          test "$(grep -c '^Completed tests in CoreAudio combined output timestamps' utr.log)" -eq 8
 
   ios-compile:
     runs-on: macos-latest
@@ -35,12 +40,14 @@ jobs:
       - uses: actions/checkout@v4
       # Compiles juce_Audio_ios.cpp for the iOS simulator
       - name: Configure and build for the iOS simulator
+        shell: bash    # -eo pipefail: without it the build's status is tee's and a failed build passes
         run: |
           cmake -S .github/ci/timestamps-apple -B build-ios -G Xcode \
             -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphonesimulator -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO
           cmake --build build-ios --target ios_compile_probe --config Release 2>&1 | tee build-ios.log
           grep -E "warning:" build-ios.log | grep -E "juce_Audio_ios|juce_CallbackTimeHelpers" || true
+          grep -qE "CompileC .*juce_audio_devices\.mm" build-ios.log
 
   combined-device:
     runs-on: macos-latest
@@ -56,6 +63,7 @@ jobs:
           sleep 5
           system_profiler SPAudioDataType || true
       - name: Build the check
+        shell: bash
         run: |
           command -v ninja || brew install ninja
           cmake -S .github/ci/timestamps-apple -B build-check -G Ninja -DCMAKE_BUILD_TYPE=Release

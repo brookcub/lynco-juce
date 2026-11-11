@@ -52,9 +52,11 @@ jobs:
           cmake -S .github/ci/ts-harness -B hbuild -G Ninja -DCMAKE_BUILD_TYPE=Release -DJUCE_SRC="$PWD"
           cmake --build hbuild
 
-      # The server's clock decides the role (SPEC ruling 8): present when it agrees with
-      # CLOCK_MONOTONIC within 1 ms, otherwise absent in every callback. "auto" accepts either
-      # outcome and checks it fully.
+      # SPEC ruling 8: present iff jack_get_time() agrees with CLOCK_MONOTONIC within 1 ms. The
+      # harness measures that itself (and prints CLOCK_MONOTONIC - CLOCK_MONOTONIC_RAW). jackd2
+      # 1.9.21 stamps cycles with CLOCK_MONOTONIC_RAW, so this run must take the absent path; a red
+      # "the clocks disagree" here means the runner's two clocks were within 0.5 ms (ruling 8
+      # cannot tell them apart, see HARNESS-REVIEW.md), not a backend defect.
       - name: JACK dummy server
         run: |
           export JACK_NO_AUDIO_RESERVATION=1
@@ -62,11 +64,11 @@ jobs:
           JP=$!
           sleep 3
           xvfb-run -a ./hbuild/ts-harness_artefacts/Release/ts-harness list || true
-          xvfb-run -a ./hbuild/ts-harness_artefacts/Release/ts-harness jack 20 auto
+          xvfb-run -a ./hbuild/ts-harness_artefacts/Release/ts-harness jack 20 require-absent
           kill $JP
 
       # Wiring check only: CLOCK_MONOTONIC reads as CLOCK_MONOTONIC_RAW in the client process, which
-      # is the clock jackd2 uses.
+      # is the clock jackd2 uses, so the present path runs and its values are checked.
       - name: JACK dummy server, client clock shimmed to CLOCK_MONOTONIC_RAW
         run: |
           export JACK_NO_AUDIO_RESERVATION=1
@@ -74,8 +76,18 @@ jobs:
           jackd -d dummy -r 48000 -p 256 > jackd2.log 2>&1 &
           JP=$!
           sleep 3
-          xvfb-run -a env LD_PRELOAD=$PWD/rawshim.so ./hbuild/ts-harness_artefacts/Release/ts-harness jack 20
+          xvfb-run -a env LD_PRELOAD=$PWD/rawshim.so ./hbuild/ts-harness_artefacts/Release/ts-harness jack 20 require-present
           kill $JP
+
+      # Runs on every runner (no sound card needed): null-plugin PCMs must have no stream roles
+      - name: ALSA null plugin
+        run: |
+          mkdir -p nullhome
+          cat > nullhome/.asoundrc <<'EOF'
+          pcm.tsnull_out { type null  hint { show on  description "TS null out" } }
+          pcm.tsnull_in  { type null  hint { show on  description "TS null in" } }
+          EOF
+          HOME=$PWD/nullhome xvfb-run -a ./hbuild/ts-harness_artefacts/Release/ts-harness alsa "TS null out" "TS null in" 5 absent
 
       - name: ALSA loopback (snd-aloop)
         run: |
@@ -93,5 +105,5 @@ jobs:
           EOF
           H="xvfb-run -a ./hbuild/ts-harness_artefacts/Release/ts-harness"
           $H list
-          $H alsa "TS loop out" "TS loop in" 20
+          $H alsa "TS loop out" "TS loop in" 20 present /proc/asound/Loopback/pcm0p/sub0/hw_params /proc/asound/Loopback/pcm1c/sub0/hw_params
           $H alsa "TS plug out" "TS plug in" 10 absent

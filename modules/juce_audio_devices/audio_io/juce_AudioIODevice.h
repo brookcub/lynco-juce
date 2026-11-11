@@ -38,35 +38,100 @@ namespace juce
 class AudioIODevice;
 
 /**
+    One native device timestamp: the time at which one sample of a stream passed the
+    reference point its source names, and where that sample is relative to the
+    callback's buffer.
+
+    timeNs is in nanoseconds on the clock and origin of Time::getHighResolutionTicks()
+    (QueryPerformanceCounter on Windows, mach_absolute_time on Apple, CLOCK_MONOTONIC on
+    Android and Linux), converted from the native value by an exact unit conversion (for
+    ASIO, plus a clock-origin offset measured once when the device starts). It is what the
+    OS or driver reported, with no latency, smoothing or rate correction. Zero is a valid
+    time.
+
+    sampleOffset is the timestamped sample's position minus the position of the first
+    sample of the callback's buffer, in sample frames (not interleaved values): negative
+    means before the buffer, zero its first sample, positive after its start. A real
+    sample after leading padding can have a positive offset; padding is never timestamped.
+
+    The one adjustment a backend may make is when sample-rate conversion puts the native
+    position x between two application samples: the position becomes the nearest sample,
+    n = floor (x + 1/2), and the time moves by (n - x) samples at the application sample
+    rate, which is never more than half a sample period. It is applied once.
+
+    @tags{Audio}
+*/
+struct AudioIODeviceTimestamp
+{
+    int64_t timeNs = 0;
+    int64_t sampleOffset = 0;
+
+    /** The native source's own qualifications of this reading, as a combination of the
+        flags below. A reading that the source marks invalid without a value is absent.
+    */
+    uint32_t nativeFlags = 0;
+
+    enum : uint32_t
+    {
+        nativeDiscontinuity   = 1u << 0, /**< The source marked a data discontinuity or reset. */
+        nativeTimestampError  = 1u << 1, /**< The source marked this time as erroneous. */
+        nativeReducedAccuracy = 1u << 2  /**< The source marked this reading as less accurate. */
+    };
+};
+
+/**
     Additional information that may be passed to the AudioIODeviceCallback.
+
+    Each role pointer is nullptr when there is no observation for this callback, and
+    otherwise points to one native observation for that role's stream. nullptr is the
+    only absence marker. Each backend's sources:
+
+    | Backend                | inputStream                                       | outputStream                                       | processingCycle           |
+    |------------------------|---------------------------------------------------|----------------------------------------------------|---------------------------|
+    | CoreAudio, one device  | inInputTime: the buffer's first frame acquired    | inOutputTime: the buffer's first frame to be       | -                         |
+    |                        | from the hardware (observation)                   | passed to the hardware (prediction)                |                           |
+    | CoreAudio, combined    | the input device's inInputTime                    | -                                                  | -                         |
+    | iOS                    | -                                                 | -                                                  | the render timestamp, at  |
+    |                        |                                                   |                                                    | offset 0, with no capture |
+    |                        |                                                   |                                                    | or presentation claim     |
+    | WASAPI                 | GetBuffer: the capture time of the first frame of | IAudioClock::GetPosition: the frame playing at the | -                         |
+    |                        | the packet holding the callback's first real      | reported time (observation)                        |                           |
+    |                        | sample (observation)                              |                                                    |                           |
+    | Oboe (AAudio, API 30+) | getTimestamp: a frame entering the pipeline       | getTimestamp: a frame leaving the pipeline         | -                         |
+    | ASIO                   | -                                                 | -                                                  | the current block's       |
+    |                        |                                                   |                                                    | systemTime, at offset 0   |
+    | ALSA                   | snd_pcm_htimestamp: the hardware pointer's        | snd_pcm_htimestamp: the hardware pointer's         | -                         |
+    |                        | position at its last update (ring/DMA reference)  | position at its last update (ring/DMA reference)   |                           |
+    | JACK                   | -                                                 | -                                                  | jack_get_cycle_times: the |
+    |                        |                                                   |                                                    | current cycle, offset 0   |
+    | all others             | -                                                 | -                                                  | -                         |
+
+    An observation never crosses a stop: audioDeviceAboutToStart and audioDeviceStopped
+    delimit the run that a role's sample positions belong to.
 
     @tags{Audio}
 */
 struct AudioIODeviceCallbackContext
 {
-    /** The time of the first output sample of this callback, or of the first input
-        sample if the callback has no output. Points to a value in nanoseconds, or is
-        nullptr if that time can't be established, even if there are outputs.
-
-        Both this and inputHostTimeNs are on the platform's high-resolution
-        monotonic clock, the timeline of Time::getHighResolutionTicks() (QPC on
-        Windows, CLOCK_MONOTONIC on Android and Linux, mach host time on Apple).
-
-        They are times the OS or driver reports for the audio pipeline, with no
-        latency or bias correction. They are not when the signal reached the DAC or
-        left the ADC: hardware, DSP and acoustic delay the driver doesn't report are
-        outside this contract. Output times are predictions of when the output will
-        be presented. Converting a device's position and time pair to the time of
-        this callback's first sample is part of the contract; guessing a latency is not.
+    /** If the host provides this information, this field will be set to point to
+        an integer holding the current value; otherwise, this will be nullptr.
     */
     const uint64_t* hostTimeNs = nullptr;
 
-    /** The time of the first input sample actually captured into this callback,
-        in nanoseconds on the same clock as hostTimeNs. This is nullptr if the device
-        doesn't provide one, or if the first sample was not captured (for example
-        when the start of the block is padding).
+    /** A time at the source's input capture or pipeline reference point, for a sample
+        of the input stream. Not necessarily when the signal left the ADC.
     */
-    const uint64_t* inputHostTimeNs = nullptr;
+    const AudioIODeviceTimestamp* inputStream = nullptr;
+
+    /** A time at the source's playback or presentation reference point, for a sample of
+        the output stream: an observed position or a native prediction, per source.
+    */
+    const AudioIODeviceTimestamp* outputStream = nullptr;
+
+    /** The native time of the processing cycle this callback belongs to, with no claim
+        about capture or presentation.
+    */
+    const AudioIODeviceTimestamp* processingCycle = nullptr;
 };
 
 //==============================================================================

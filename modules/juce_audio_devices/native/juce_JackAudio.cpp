@@ -91,6 +91,8 @@ JUCE_DECL_JACK_FUNCTION (int, jack_set_xrun_callback, (jack_client_t* client, Ja
 JUCE_DECL_JACK_FUNCTION (int, jack_port_flags, (const jack_port_t* port), (port))
 JUCE_DECL_JACK_FUNCTION (jack_port_t*, jack_port_by_name, (jack_client_t* client, const char* name), (client, name))
 JUCE_DECL_VOID_JACK_FUNCTION (jack_free, (void* ptr), (ptr))
+JUCE_DECL_JACK_FUNCTION (int, jack_get_cycle_times, (const jack_client_t* client, jack_nframes_t* current_frames, jack_time_t* current_usecs, jack_time_t* next_usecs, float* period_usecs), (client, current_frames, current_usecs, next_usecs, period_usecs))
+JUCE_DECL_JACK_FUNCTION (jack_time_t, jack_get_time, (), ())
 
 #if JUCE_DEBUG
  #define JACK_LOGGING_ENABLED 1
@@ -304,6 +306,7 @@ public:
         juce::jack_on_shutdown (client, shutdownCallback, this);
         juce::jack_on_info_shutdown (client, infoShutdownCallback, this);
         juce::jack_set_xrun_callback (client, xrunCallback, this);
+        cycleTimesAreMonotonic = jackClockIsMonotonic();
         juce::jack_activate (client);
         deviceIsOpen = true;
 
@@ -476,12 +479,26 @@ private:
         if (callback != nullptr)
         {
             if ((numActiveInChans + numActiveOutChans) > 0)
+            {
+                // The current cycle's start, as JACK reports it; absent if the call fails or this
+                // server's clock was not shown to be CLOCK_MONOTONIC at activation.
+                jack_nframes_t cycleFrames = 0;
+                jack_time_t cycleUsecs = 0, nextUsecs = 0;
+                float periodUsecs = 0;
+
+                const auto cycleResult = juce::jack_get_cycle_times (client, &cycleFrames, &cycleUsecs, &nextUsecs, &periodUsecs);
+                const auto cycle = CallbackTimeHelpers::getJackProcessingCycle (cycleResult, cycleUsecs, cycleTimesAreMonotonic);
+
+                AudioIODeviceCallbackContext context;
+                context.processingCycle = cycle.has_value() ? &*cycle : nullptr;
+
                 callback->audioDeviceIOCallbackWithContext (inChans.getData(),
                                                             numActiveInChans,
                                                             outChans,
                                                             numActiveOutChans,
                                                             numSamples,
-                                                            {});
+                                                            context);
+            }
         }
         else
         {
@@ -572,7 +589,35 @@ private:
         JUCE_JACK_LOG ("JackAudioIODevice::errorCallback " + String (msg));
     }
 
+    /*  Whether jack_get_time() is on JUCE's clock: read it between two CLOCK_MONOTONIC readings and
+        accept it if it lies within a millisecond of them (microseconds then convert exactly, x 1000,
+        with no offset). jackd's clock source is chosen when the server starts, so this is checked
+        on the running server at every activation. Anywhere but Linux and BSD, JUCE's clock is
+        another one, and the cycle time stays absent.
+    */
+    static bool jackClockIsMonotonic()
+    {
+       #if JUCE_LINUX || JUCE_BSD
+        const auto nanosecondsNow = []
+        {
+            timespec t;
+            clock_gettime (CLOCK_MONOTONIC, &t);
+            return (int64_t) t.tv_sec * 1'000'000'000 + (int64_t) t.tv_nsec;
+        };
+
+        constexpr int64_t toleranceNs = 1'000'000;
+        const auto before = nanosecondsNow();
+        const auto jackNs = (int64_t) juce::jack_get_time() * 1000;
+        const auto after = nanosecondsNow();
+
+        return jackNs >= before - toleranceNs && jackNs <= after + toleranceNs;
+       #else
+        return false;
+       #endif
+    }
+
     bool deviceIsOpen = false;
+    bool cycleTimesAreMonotonic = false;
     jack_client_t* client = nullptr;
     String lastError;
     AudioIODeviceCallback* callback = nullptr;

@@ -548,4 +548,47 @@ inline int64_t unwrapTimeGetTimeNs (int64_t driverTimeNs, int64_t referenceNs) n
     return driverTimeNs + k * periodNs;
 }
 
+//==============================================================================
+/** One snd_pcm_status reading: availFrames were available when the hardware pointer was last
+    updated, at that update's tstamp (seconds and nanoseconds).
+*/
+struct AlsaPositionReading
+{
+    int64_t availFrames = 0;
+    int64_t seconds = 0;
+    int64_t nanoseconds = 0;
+};
+
+/*  The observation of an ALSA PCM from one coherent snd_pcm_status reading: the frame at the
+    hardware pointer, at the reading's time converted exactly to ns.
+
+    applicationFramesAtReading is the application's own count of frames transferred (read for
+    capture, written for playback) when the reading was taken, and bufferStartFrame the frame index
+    of the callback buffer's first frame in the same count. The hardware pointer is at
+    applicationFramesAtReading + availFrames for capture, and applicationFramesAtReading -
+    (ringBufferFrames - availFrames) for playback; the offset is that minus bufferStartFrame.
+
+    nullopt if there is no reading, if the PCM's timestamps are not on CLOCK_MONOTONIC (JUCE's clock
+    on Linux), or if availFrames is outside [0, ringBufferFrames] (an overrun or underrun, where the
+    count no longer describes the ring).
+*/
+inline std::optional<AudioIODeviceTimestamp> getAlsaTimestamp (bool isCapture,
+                                                               const std::optional<AlsaPositionReading>& reading,
+                                                               bool timestampsAreMonotonic,
+                                                               int64_t applicationFramesAtReading,
+                                                               int64_t bufferStartFrame,
+                                                               int64_t ringBufferFrames) noexcept
+{
+    if (! reading.has_value() || ! timestampsAreMonotonic
+        || reading->availFrames < 0 || reading->availFrames > ringBufferFrames)
+        return {};
+
+    const auto hardwarePointer = isCapture ? applicationFramesAtReading + reading->availFrames
+                                           : applicationFramesAtReading - (ringBufferFrames - reading->availFrames);
+
+    return AudioIODeviceTimestamp { reading->seconds * 1'000'000'000 + reading->nanoseconds,
+                                    hardwarePointer - bufferStartFrame,
+                                    0 };
+}
+
 } // namespace juce::CallbackTimeHelpers

@@ -306,6 +306,8 @@ public:
             return false;
         }
 
+        configureTimestamps (swParams);
+
        #if JUCE_ALSA_LOGGING
         // enable this to dump the config of the devices that get opened
         snd_output_t* out;
@@ -317,6 +319,47 @@ public:
         numChannelsRunning = numChannels;
 
         return true;
+    }
+
+    //==============================================================================
+    /*  The observation of this PCM for the callback whose buffer is about to be (output) or has just
+        been (input) transferred: one snd_pcm_status call gives the available frames and the time of
+        the hardware pointer update they belong to, which getAlsaTimestamp associates with this
+        device's own count of transferred frames.
+
+        Only a direct hardware PCM has that association. A plugin (plug, dmix, rate, ...) may convert
+        rates, share the ring or hide it, so there the role is absent. Timestamps are requested on
+        CLOCK_MONOTONIC when the PCM is configured; a status that is not RUNNING, or whose time was
+        not stamped (zero), is not an observation.
+    */
+    std::optional<AudioIODeviceTimestamp> getTimestamp (int numSamples) const
+    {
+        if (handle == nullptr || ! monotonicTimestamps || ringFrames == 0
+            || snd_pcm_type (handle) != SND_PCM_TYPE_HW
+            || (isInput && ! lastTransferWasFull))
+            return {};
+
+        snd_pcm_status_t* status;
+        snd_pcm_status_alloca (&status);
+
+        if (snd_pcm_status (handle, status) < 0 || snd_pcm_status_get_state (status) != SND_PCM_STATE_RUNNING)
+            return {};
+
+        snd_htimestamp_t stamp;
+        snd_pcm_status_get_htstamp (status, &stamp);
+
+        if (stamp.tv_sec == 0 && stamp.tv_nsec == 0)
+            return {};
+
+        const CallbackTimeHelpers::AlsaPositionReading reading { (int64_t) snd_pcm_status_get_avail (status),
+                                                                 (int64_t) stamp.tv_sec,
+                                                                 (int64_t) stamp.tv_nsec };
+
+        // Input has just been read, so the buffer began numSamples before the count; output is
+        // about to be written, so it begins at the count.
+        return CallbackTimeHelpers::getAlsaTimestamp (isInput, reading, monotonicTimestamps, framesTransferred,
+                                                      isInput ? framesTransferred - numSamples : framesTransferred,
+                                                      (int64_t) ringFrames);
     }
 
     //==============================================================================
@@ -351,6 +394,10 @@ public:
             if (JUCE_ALSA_FAILED (snd_pcm_recover (handle, (int) numDone, 1 /* silent */)))
                 return false;
         }
+        else
+        {
+            framesTransferred += numDone;
+        }
 
         if (numDone < numSamples)
             JUCE_ALSA_LOG ("Did not write all samples: numDone: " << numDone << ", numSamples: " << numSamples);
@@ -369,6 +416,7 @@ public:
             scratch.fillWith (0); // (not clearing this data causes warnings in valgrind)
 
             auto num = snd_pcm_readi (handle, scratch.getData(), (snd_pcm_uframes_t) numSamples);
+            noteRead (num, numSamples);
 
             if (num < 0)
             {
@@ -389,6 +437,7 @@ public:
         else
         {
             auto num = snd_pcm_readn (handle, (void**) data, (snd_pcm_uframes_t) numSamples);
+            noteRead (num, numSamples);
 
             if (num < 0)
             {
@@ -416,6 +465,56 @@ public:
     int underrunCount = 0, overrunCount = 0;
 
 private:
+    //==============================================================================
+    /*  Frames moved between the application and the PCM since it was opened: the application's
+        cursor that getTimestamp associates the hardware pointer with. lastTransferWasFull says that
+        the latest read delivered the whole buffer, which an input observation needs.
+    */
+    int64_t framesTransferred = 0;
+    bool lastTransferWasFull = false;
+    snd_pcm_uframes_t ringFrames = 0;
+    bool monotonicTimestamps = false;
+
+    void noteRead (snd_pcm_sframes_t numRead, int numWanted) noexcept
+    {
+        lastTransferWasFull = (numRead == numWanted);
+
+        if (numRead > 0)
+            framesTransferred += numRead;
+    }
+
+    /*  Asks for status timestamps stamped on CLOCK_MONOTONIC, JUCE's clock on Linux, and reads the
+        configured type back: the timestamps are used only if the PCM now reports MONOTONIC.
+    */
+    void configureTimestamps (snd_pcm_sw_params_t* swParams)
+    {
+        snd_pcm_hw_params_t* hwParams;
+        snd_pcm_hw_params_alloca (&hwParams);
+
+        monotonicTimestamps = false;
+
+        if (snd_pcm_hw_params_current (handle, hwParams) < 0
+            || snd_pcm_hw_params_get_buffer_size (hwParams, &ringFrames) < 0)
+        {
+            ringFrames = 0;
+            return;
+        }
+
+        if (snd_pcm_sw_params_set_tstamp_mode (handle, swParams, SND_PCM_TSTAMP_ENABLE) < 0
+            || snd_pcm_sw_params_set_tstamp_type (handle, swParams, SND_PCM_TSTAMP_TYPE_MONOTONIC) < 0
+            || snd_pcm_sw_params (handle, swParams) < 0)
+            return;
+
+        snd_pcm_tstamp_t mode;
+        snd_pcm_tstamp_type_t type;
+
+        monotonicTimestamps = snd_pcm_sw_params_current (handle, swParams) >= 0
+                               && snd_pcm_sw_params_get_tstamp_mode (swParams, &mode) >= 0
+                               && snd_pcm_sw_params_get_tstamp_type (swParams, &type) >= 0
+                               && mode == SND_PCM_TSTAMP_ENABLE
+                               && type == SND_PCM_TSTAMP_TYPE_MONOTONIC;
+    }
+
     //==============================================================================
     String deviceID;
     const bool isInput;
@@ -723,12 +822,21 @@ public:
 
                 if (callback != nullptr)
                 {
+                    // Each role is an observation of its own PCM, absent unless that PCM is a direct
+                    // hardware device with a coherent status (see ALSADevice::getTimestamp).
+                    const auto inputStamp  = inputDevice  != nullptr ? inputDevice ->getTimestamp (bufferSize) : std::nullopt;
+                    const auto outputStamp = outputDevice != nullptr ? outputDevice->getTimestamp (bufferSize) : std::nullopt;
+
+                    AudioIODeviceCallbackContext context;
+                    context.inputStream  = inputStamp.has_value()  ? &*inputStamp  : nullptr;
+                    context.outputStream = outputStamp.has_value() ? &*outputStamp : nullptr;
+
                     callback->audioDeviceIOCallbackWithContext (inputChannelDataForCallback.getRawDataPointer(),
                                                                 inputChannelDataForCallback.size(),
                                                                 outputChannelDataForCallback.getRawDataPointer(),
                                                                 outputChannelDataForCallback.size(),
                                                                 bufferSize,
-                                                                {});
+                                                                context);
                 }
                 else
                 {

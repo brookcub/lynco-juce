@@ -110,6 +110,9 @@ struct AudioIODeviceTimestamp
     |                        |                                                   |                                                    | the block's start: 0 for  |
     |                        |                                                   |                                                    | its own pair, -blockSize  |
     |                        |                                                   |                                                    | for the previous one's    |
+    | ALSA                   | snd_pcm_status: the hardware pointer's position   | snd_pcm_status: the hardware pointer's position at | -                         |
+    |                        | at its last update, with that update's tstamp     | its last update, with that update's tstamp         |                           |
+    |                        | (ring/DMA reference)                              | (ring/DMA reference)                               |                           |
     | all others             | -                                                 | -                                                  | -                         |
 
     An observation never crosses a stop: audioDeviceAboutToStart and audioDeviceStopped

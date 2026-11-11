@@ -92,6 +92,10 @@ struct AudioIODeviceTimestamp
 
     | Backend                | inputStream                                       | outputStream                                       | processingCycle           |
     |------------------------|---------------------------------------------------|----------------------------------------------------|---------------------------|
+    | CoreAudio, one device  | inInputTime: the buffer's first frame acquired    | inOutputTime: the buffer's first frame to be       | -                         |
+    |                        | from the hardware (observation)                   | passed to the hardware (prediction)                |                           |
+    | CoreAudio, combined    | the input device's inInputTime                    | the output device's inOutputTime, at the frame it  | -                         |
+    |                        |                                                   | read from the FIFO (prediction)                    |                           |
     | WASAPI                 | GetBuffer: the capture time of the first frame of | IAudioClock::GetPosition: the frame playing at the | -                         |
     |                        | the packet holding the callback's first real      | reported time (observation)                        |                           |
     |                        | sample (observation)                              |                                                    |                           |

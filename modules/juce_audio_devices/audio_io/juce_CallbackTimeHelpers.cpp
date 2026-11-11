@@ -149,4 +149,232 @@ inline std::optional<AudioIODeviceTimestamp> getOboeOutputTimestamp (const std::
     return AudioIODeviceTimestamp { stream->timeNs, stream->framePosition - framesWrittenBeforeCallback, 0 };
 }
 
+//==============================================================================
+/*  The observation of an Apple AudioTimeStamp that belongs to the first frame of a buffer, as
+    CoreAudio's IOProc stamps and the iOS render callback's stamp do: the host time converted with
+    hostTimeToNanos, at offset 0. The stamp is anything with mFlags and mHostTime.
+
+    nullopt if there is no stamp or its flags do not include hostTimeValidFlag.
+
+    Used by P014.1 (CoreAudio) and P020 (the iOS render cycle).
+*/
+template <typename Stamp, typename Flags, typename HostTimeToNanos>
+std::optional<AudioIODeviceTimestamp> getBufferStartTimestamp (const Stamp* stamp,
+                                                               Flags hostTimeValidFlag,
+                                                               HostTimeToNanos&& hostTimeToNanos)
+{
+    if (stamp == nullptr || (stamp->mFlags & hostTimeValidFlag) == 0)
+        return {};
+
+    return AudioIODeviceTimestamp { (int64_t) hostTimeToNanos (stamp->mHostTime), 0, 0 };
+}
+
+/** What one chunk of a CoreAudio IOProc buffer passes to its callback. */
+struct CoreAudioChunkTimes
+{
+    std::optional<uint64_t> hostTimeNs;
+    std::optional<AudioIODeviceTimestamp> inputStream, outputStream;
+};
+
+/*  The times of the chunk that starts chunkStart samples into the IOProc's buffers. The input and
+    output observations are the IOProc's inInputTime and inOutputTime stamps (getBufferStartTimestamp)
+    seen from the chunk (forChunkAt), each only when the callback has channels in that direction.
+
+    hostTimeNs is upstream JUCE 8.0.12's: on the first chunk only, the host time of the output stamp
+    when the callback has outputs and of the input stamp otherwise, converted without checking the
+    stamp's flags; nullopt on later chunks or without that stamp.
+*/
+template <typename Stamp, typename Flags, typename HostTimeToNanos>
+CoreAudioChunkTimes getCoreAudioChunkTimes (const Stamp* inputStamp,
+                                            const Stamp* outputStamp,
+                                            int numInputChannels,
+                                            int numOutputChannels,
+                                            int64_t chunkStart,
+                                            Flags hostTimeValidFlag,
+                                            HostTimeToNanos&& hostTimeToNanos)
+{
+    CoreAudioChunkTimes result;
+
+    const auto seenFromChunk = [&] (const Stamp* stamp, int numChannels) -> std::optional<AudioIODeviceTimestamp>
+    {
+        if (numChannels <= 0)
+            return {};
+
+        if (auto start = getBufferStartTimestamp (stamp, hostTimeValidFlag, hostTimeToNanos))
+            return forChunkAt (*start, chunkStart);
+
+        return {};
+    };
+
+    result.inputStream  = seenFromChunk (inputStamp, numInputChannels);
+    result.outputStream = seenFromChunk (outputStamp, numOutputChannels);
+
+    if (const auto* hostStamp = numOutputChannels > 0 ? outputStamp : inputStamp; hostStamp != nullptr && chunkStart == 0)
+        result.hostTimeNs = (uint64_t) hostTimeToNanos (hostStamp->mHostTime);
+
+    return result;
+}
+
+/*  The context that AudioIODeviceCombiner passes its callback from its input device's callback. It
+    keeps the input device's hostTimeNs, as upstream does, and its input observation. The callback's
+    outputs are presented later on another device, through a FIFO whose correspondence to the
+    output device's stamps is established by CombinedOutputCorrespondence, which the combiner adds
+    itself, so the context built here has no output or cycle observation.
+*/
+inline AudioIODeviceCallbackContext getCombinedCallbackContext (const AudioIODeviceCallbackContext& inputDeviceContext) noexcept
+{
+    return { inputDeviceContext.hostTimeNs, inputDeviceContext.inputStream, nullptr, nullptr };
+}
+
+//==============================================================================
+/*  Which application output frame an AudioIODeviceCombiner's output device presented, so that the
+    application's callback can carry the output device's inOutputTime.
+
+    The application's callback runs from the input device and writes its output to the combiner's
+    FIFO; the output device's callback reads the FIFO later, on its own thread, and its stamp names
+    the first frame of what it read. Both sides use the FIFO's absolute addresses. While the
+    application's buffers occupy consecutive addresses, the distance between two addresses is the
+    distance between their frames, so an observation read at address A is at offset A - W for an
+    application buffer written at address W. The latest observation is repeated until a newer one
+    replaces it.
+
+    Called from both devices' threads; the implementation does not lock or allocate. Each side
+    owns its state and publishes it in a SeqLock; reset() only bumps an atomic epoch, so that
+    neither thread ever writes the other's state.
+*/
+class CombinedOutputCorrespondence
+{
+public:
+    /*  Forgets the correspondence, as when the device starts or an xrun invalidates both FIFO
+        positions. There is no observation until frames are written and a stamped frame is read again.
+    */
+    void reset() noexcept
+    {
+        epoch.fetch_add (1);
+    }
+
+    /*  The application's buffer of numFrames frames went to FIFO addresses [writeStart, writeStart +
+        numFrames). A write that does not follow the previous one (frames were dropped or the addresses
+        jumped) loses the correspondence, as reset() does, and starts a new run of addresses.
+    */
+    void wrote (uint64_t writeStart, int numFrames) noexcept
+    {
+        const auto e = epoch.load();
+        const auto run = runs.load();
+        const auto end = writeStart + (uint64_t) numFrames;
+
+        if (run && run->epoch == e && run->end == writeStart)
+            runs.store (Run { e, run->id, run->start, end });
+        else
+            runs.store (Run { e, (run ? run->id : 0) + 1, writeStart, end });
+    }
+
+    /*  The output device's callback filled numFrames frames: the first numPaddingFrames of them with
+        silence, and the rest from FIFO addresses readStart + numPaddingFrames onwards. outputStamp is
+        that callback's output observation, relative to its own buffer. It becomes the observation if
+        the frame it stamps was read from the FIFO in this callback (not padding) and was written by
+        the application since the last reset; otherwise the previous observation is kept.
+    */
+    void read (uint64_t readStart,
+               int numFrames,
+               int numPaddingFrames,
+               const std::optional<AudioIODeviceTimestamp>& outputStamp) noexcept
+    {
+        const auto run = runs.load();
+
+        // The stamped frame's index in this callback's buffer must be one that was read, not padding
+        if (! outputStamp || ! run || run->epoch != epoch.load()
+            || outputStamp->sampleOffset < numPaddingFrames || outputStamp->sampleOffset >= numFrames)
+            return;
+
+        const auto address = readStart + (uint64_t) outputStamp->sampleOffset;
+
+        if (address >= run->start && address < run->end)
+            observations.store (Observation { run->id, outputStamp->timeNs, address, outputStamp->nativeFlags });
+    }
+
+    /*  The output observation for the application buffer about to be written at writeStart: the
+        latest observation's time and flags, at offset (its address - writeStart). nullopt if there is
+        no observation, or writeStart does not continue the run of addresses written since the reset.
+    */
+    std::optional<AudioIODeviceTimestamp> observationFor (uint64_t writeStart) const noexcept
+    {
+        const auto run = runs.load();
+        const auto observation = observations.load();
+
+        if (! run || ! observation || run->epoch != epoch.load() || run->end != writeStart || observation->runId != run->id)
+            return {};
+
+        return AudioIODeviceTimestamp { observation->timeNs, (int64_t) (observation->address - writeStart), (uint32_t) observation->flags };
+    }
+
+private:
+    struct Run         { uint64_t epoch, id, start, end; };
+    struct Observation { uint64_t runId; int64_t timeNs; uint64_t address; uint64_t flags; };
+
+    /*  A value written by one thread and read by any, without locks: the writer never waits, and a
+        reader that keeps colliding with a write gives up and sees no value (which only ever means
+        "no observation"). The words are atomics so that a torn read is not a data race.
+    */
+    template <typename T>
+    class SeqLock
+    {
+    public:
+        void store (const T& value) noexcept
+        {
+            uint64_t source[numWords];
+            std::memcpy (source, &value, sizeof (T));
+
+            const auto s = sequence.load (std::memory_order_relaxed);
+            sequence.store (s + 1, std::memory_order_relaxed);
+            std::atomic_thread_fence (std::memory_order_release);
+
+            for (size_t i = 0; i < numWords; ++i)
+                words[i].store (source[i], std::memory_order_relaxed);
+
+            sequence.store (s + 2, std::memory_order_release);
+        }
+
+        std::optional<T> load() const noexcept
+        {
+            for (int attempt = 0; attempt < 8; ++attempt)
+            {
+                const auto before = sequence.load (std::memory_order_acquire);
+
+                if (before == 0)
+                    return {};   // never stored
+
+                if (before % 2 != 0)
+                    continue;
+
+                uint64_t copy[numWords];
+
+                for (size_t i = 0; i < numWords; ++i)
+                    copy[i] = words[i].load (std::memory_order_relaxed);
+
+                std::atomic_thread_fence (std::memory_order_acquire);
+
+                if (sequence.load (std::memory_order_relaxed) == before)
+                {
+                    T value;
+                    std::memcpy (&value, copy, sizeof (T));
+                    return value;
+                }
+            }
+
+            return {};
+        }
+
+    private:
+        static_assert (std::is_trivially_copyable_v<T> && sizeof (T) % sizeof (uint64_t) == 0);
+        static constexpr size_t numWords = sizeof (T) / sizeof (uint64_t);
+        std::atomic<uint64_t> sequence { 0 };
+        std::atomic<uint64_t> words[numWords] {};
+    };
+
+    std::atomic<uint64_t> epoch { 0 };
+    SeqLock<Run> runs;                  // written by wrote() only
+    SeqLock<Observation> observations;  // written by read() only
+};
+
 } // namespace juce::CallbackTimeHelpers

@@ -1125,19 +1125,24 @@ private:
             std::copy (src, src + (ptrdiff_t) numSamplesInChunk, inStream->tempBuffers[(size_t) index]);
         }
 
-        // only pass a timestamp for the first chunk of each buffer
-        const auto* timeStamp = std::invoke ([&]() -> const AudioTimeStamp*
-        {
-            if (sampleOffset != 0)
-                return nullptr;
+        // The stamps belong to the first sample of the whole buffer, so a chunk sees them at offset -sampleOffset.
+        // Input is only timed if it is captured into this callback.
+        const auto times = CallbackTimeHelpers::getCoreAudioChunkTimes (inputTimestamp,
+                                                                        outputTimestamp,
+                                                                        numInputChans,
+                                                                        numOutputChans,
+                                                                        (int64_t) sampleOffset,
+                                                                        kAudioTimeStampHostTimeValid,
+                                                                        [this] (uint64_t hostTime) { return timeConversions.hostTimeToNanos (hostTime); });
 
-            return numOutputChans > 0 ? outputTimestamp : inputTimestamp;
-        });
+        const auto hostTimeNs = times.hostTimeNs.value_or (0);
 
-        const auto nanos = timeStamp != nullptr ? timeConversions.hostTimeToNanos (timeStamp->mHostTime) : 0;
         const AudioIODeviceCallbackContext context
         {
-            timeStamp != nullptr ? &nanos : nullptr,
+            times.hostTimeNs.has_value()   ? &hostTimeNs : nullptr,
+            times.inputStream.has_value()  ? &*times.inputStream  : nullptr,
+            times.outputStream.has_value() ? &*times.outputStream : nullptr,
+            nullptr
         };
 
         callback->audioDeviceIOCallbackWithContext (getTempBuffers (inStream),
@@ -1825,6 +1830,9 @@ private:
     std::atomic<int> xruns { -1 };
     std::atomic<uint64_t> lastValidReadPosition { invalidSampleTime };
 
+    // Which application frame the output device's stamps name; see CombinedOutputCorrespondence
+    CallbackTimeHelpers::CombinedOutputCorrespondence outputCorrespondence;
+
     BigInteger inputChannelsRequested, outputChannelsRequested;
     double sampleRateRequested = 44100;
     int bufferSizeRequested = 512;
@@ -1860,6 +1868,7 @@ private:
     void reset()
     {
         xruns.store (0);
+        outputCorrespondence.reset();
         fifo.clear();
         scratchBuffer.clear();
 
@@ -1907,12 +1916,23 @@ private:
                 const auto numActiveOutputChannels = outputWrapper.getActiveChannels().countNumberOfSetBits();
                 jassert (numActiveOutputChannels <= scratchBuffer.getNumChannels());
 
+                // The output device's stamp, for the FIFO address this buffer is about to be written to
+                const auto plannedWritePos = writePos.load();
+                const auto outputStream = numActiveOutputChannels > 0 && plannedWritePos != invalidSampleTime
+                                        ? outputCorrespondence.observationFor (plannedWritePos)
+                                        : std::nullopt;
+
+                auto combinedContext = CallbackTimeHelpers::getCombinedCallbackContext (context);
+
+                if (outputStream.has_value())
+                    combinedContext.outputStream = &*outputStream;
+
                 callback->audioDeviceIOCallbackWithContext (channels,
                                                             numChannels,
                                                             scratchBuffer.getArrayOfWritePointers(),
                                                             numActiveOutputChannels,
                                                             n,
-                                                            context);
+                                                            combinedContext);
             }
             else
             {
@@ -1948,13 +1968,15 @@ private:
                                          args.nItems);
         });
 
+        outputCorrespondence.wrote (currentWritePos, n);
+
         {
             auto invalid = invalidSampleTime;
             lastValidReadPosition.compare_exchange_strong (invalid, nextWritePos);
         }
     }
 
-    void outputAudioCallback (float* const* channels, int numChannels, int n) noexcept
+    void outputAudioCallback (float* const* channels, int numChannels, int n, const AudioIODeviceCallbackContext& context) noexcept
     {
         auto& readPos = outputWrapper.sampleTime;
         auto currentReadPos = readPos.load();
@@ -1994,6 +2016,11 @@ private:
                                          args.nItems);
         });
 
+        outputCorrespondence.read (currentReadPos,
+                                   n,
+                                   (int) numZerosToWrite,
+                                   context.outputStream != nullptr ? std::optional (*context.outputStream) : std::nullopt);
+
         // use compare exchange here as we need to avoid the case
         // where we overwrite readPos being equal to invalidSampleTime
         readPos.compare_exchange_strong (currentReadPos, nextReadPos);
@@ -2001,6 +2028,8 @@ private:
 
     void xrun() noexcept
     {
+        outputCorrespondence.reset();
+
         for (auto& d : getDeviceWrappers())
             d->sampleTime.store (invalidSampleTime);
 
@@ -2093,7 +2122,7 @@ private:
             if (input)
                 owner.inputAudioCallback (inputChannelData, numInputChannels, numSamples, context);
             else
-                owner.outputAudioCallback (outputChannelData, numOutputChannels, numSamples);
+                owner.outputAudioCallback (outputChannelData, numOutputChannels, numSamples, context);
         }
 
         void audioDeviceAboutToStart (AudioIODevice* d)        override { owner.handleAudioDeviceAboutToStart (d); }

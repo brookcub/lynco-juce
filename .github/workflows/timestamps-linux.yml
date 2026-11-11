@@ -5,7 +5,7 @@ name: timestamps-linux
 # device-timestamp roles. Triggered by pushes to this branch only.
 on:
   push:
-    branches: [ci/timestamps-combined]
+    branches: [ci/timestamps-combined, ci/timestamps-rails]
 
 jobs:
   linux:
@@ -45,18 +45,17 @@ jobs:
           sed -n '/Test failure summary/,$p' utr.log
           if sed -n '/Test failure summary/,$p' utr.log | grep -E "^(ALSA|JACK|Callback timestamp|AudioDeviceManager)"; then exit 1; fi
           test "$(grep -c '^Completed tests in ALSA device timestamps' utr.log)" -eq 5
-          test "$(grep -c '^Completed tests in JACK processing cycle timestamps' utr.log)" -eq 2
+          test "$(grep -c '^Completed tests in JACK processing cycle timestamps' utr.log)" -eq 7
 
       - name: Build the integration harness
         run: |
           cmake -S .github/ci/ts-harness -B hbuild -G Ninja -DCMAKE_BUILD_TYPE=Release -DJUCE_SRC="$PWD"
           cmake --build hbuild
 
-      # SPEC ruling 8: present iff jack_get_time() agrees with CLOCK_MONOTONIC within 1 ms. The
-      # harness measures that itself (and prints CLOCK_MONOTONIC - CLOCK_MONOTONIC_RAW). jackd2
-      # 1.9.21 stamps cycles with CLOCK_MONOTONIC_RAW, so this run must take the absent path; a red
-      # "the clocks disagree" here means the runner's two clocks were within 0.5 ms (ruling 8
-      # cannot tell them apart, see HARNESS-REVIEW.md), not a backend defect.
+      # SPEC "JACK clock: ruling 8 replaced": present iff jack_get_time() is within 1 ms of
+      # CLOCK_MONOTONIC or CLOCK_MONOTONIC_RAW, converted to CLOCK_MONOTONIC per callback. jackd2
+      # stamps cycles with CLOCK_MONOTONIC_RAW, so this run must take the present path, and the
+      # cycle time must land on CLOCK_MONOTONIC (the harness prints MONOTONIC - RAW).
       - name: JACK dummy server
         run: |
           export JACK_NO_AUDIO_RESERVATION=1
@@ -64,19 +63,7 @@ jobs:
           JP=$!
           sleep 3
           xvfb-run -a ./hbuild/ts-harness_artefacts/Release/ts-harness list || true
-          xvfb-run -a ./hbuild/ts-harness_artefacts/Release/ts-harness jack 20 require-absent
-          kill $JP
-
-      # Wiring check only: CLOCK_MONOTONIC reads as CLOCK_MONOTONIC_RAW in the client process, which
-      # is the clock jackd2 uses, so the present path runs and its values are checked.
-      - name: JACK dummy server, client clock shimmed to CLOCK_MONOTONIC_RAW
-        run: |
-          export JACK_NO_AUDIO_RESERVATION=1
-          g++ -shared -fPIC -x c++ .github/ci/ts-harness/rawshim.c -o rawshim.so -ldl
-          jackd -d dummy -r 48000 -p 256 > jackd2.log 2>&1 &
-          JP=$!
-          sleep 3
-          xvfb-run -a env LD_PRELOAD=$PWD/rawshim.so ./hbuild/ts-harness_artefacts/Release/ts-harness jack 20 require-present
+          xvfb-run -a ./hbuild/ts-harness_artefacts/Release/ts-harness jack 20 require-present
           kill $JP
 
       # Runs on every runner (no sound card needed): null-plugin PCMs must have no stream roles

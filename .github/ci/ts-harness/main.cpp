@@ -87,9 +87,10 @@ static String find (AudioIODeviceType& t, bool input, const String& sub)
 }
 
 // The expectation for the JACK processingCycle role, decided here and not by the backend (SPEC
-// ruling 8): present iff jack_get_time() agrees with CLOCK_MONOTONIC within 1 ms. Read while the
-// device is open, so libjack is loaded and initialised. 1 = present, 0 = absent, -1 = within
-// 0.5..2 ms of the boundary, too close to decide (no presence assertion).
+// "JACK clock: ruling 8 replaced"): present iff jack_get_time() is within 1 ms of CLOCK_MONOTONIC
+// or of CLOCK_MONOTONIC_RAW. Read while the device is open, so libjack is loaded and initialised.
+// 1 = present, 0 = absent, -1 = within 0.5..2 ms of the boundary, too close to decide (no presence
+// assertion).
 static int jackClockExpectation()
 {
     auto* lib = dlopen ("libjack.so.0", RTLD_NOW | RTLD_NOLOAD);
@@ -97,14 +98,17 @@ static int jackClockExpectation()
 
     if (getTime == nullptr) { std::printf ("clock: jack_get_time not found\n"); return -1; }
 
+    const auto rawBefore = clockNs (CLOCK_MONOTONIC_RAW);
     const auto before = clockNs (CLOCK_MONOTONIC);
     const auto jackNs = (int64_t) getTime() * 1000;
     const auto after = clockNs (CLOCK_MONOTONIC);
     const auto raw = clockNs (CLOCK_MONOTONIC_RAW);
-    const auto outside = jackNs < before ? before - jackNs : (jackNs > after ? jackNs - after : 0);
+    const auto outsideOf = [jackNs] (int64_t lo, int64_t hi) { return jackNs < lo ? lo - jackNs : (jackNs > hi ? jackNs - hi : 0); };
+    const auto outside = std::min (outsideOf (before, after), outsideOf (rawBefore, raw));
 
-    std::printf ("clock: jack_get_time - CLOCK_MONOTONIC = %lld ns; CLOCK_MONOTONIC - CLOCK_MONOTONIC_RAW = %lld ns\n",
-                 (long long) (jackNs - (before + after) / 2), (long long) (after - raw));
+    std::printf ("clock: jack_get_time - CLOCK_MONOTONIC = %lld ns; jack_get_time - CLOCK_MONOTONIC_RAW = %lld ns; "
+                 "CLOCK_MONOTONIC - CLOCK_MONOTONIC_RAW = %lld ns\n",
+                 (long long) (jackNs - (before + after) / 2), (long long) (jackNs - (rawBefore + raw) / 2), (long long) (after - raw));
 
     if (outside <= 500'000)    return 1;
     if (outside >= 2'000'000)  return 0;
@@ -235,7 +239,7 @@ int main (int argc, char** argv)
     }
     else if (jack)
     {
-        // The run must exercise the path the workflow names; which path applies is the clock's call
+        // The run must exercise the path the workflow names; which path applies is the clocks' call
         std::printf ("clock decides: %s\n", jackExpected == 1 ? "present" : jackExpected == 0 ? "absent" : "undecided");
         if (expectation == "require-present") check (jackExpected == 1, "the clocks agree, so this run exercises the present path");
         if (expectation == "require-absent")  check (jackExpected == 0, "the clocks disagree, so this run exercises the absent path");
@@ -243,34 +247,48 @@ int main (int argc, char** argv)
         check (inP == 0 && outP == 0, "inputStream/outputStream absent");
 
         if (jackExpected == 0)
-            check (cycP == 0, "processingCycle absent in every callback (jack_get_time is not CLOCK_MONOTONIC)");
+            check (cycP == 0, "processingCycle absent in every callback (jack_get_time is neither CLOCK_MONOTONIC nor RAW)");
         else if (jackExpected == 1)
             check (cycP >= 0.99 * N, "processingCycle present in >= 99% of callbacks");
 
         if (cycP > 0)
         {
-            bool offsetsZero = true, increasing = true, nearNow = true, precedesEntry = true;
-            int repeats = 0;
+            bool offsetsZero = true, increasing = true, inWindow = true;
+            int repeats = 0, outside = 0;
             int64_t minLead = INT64_MAX, maxLead = INT64_MIN;
             for (size_t i = 0; i < r.size(); ++i)
             {
                 if (! r[i].cycP) continue;
                 offsetsZero = offsetsZero && r[i].cyc.sampleOffset == 0 && r[i].cyc.nativeFlags == 0;
-                nearNow = nearNow && std::abs (r[i].cyc.timeNs - r[i].nowNs) < 100'000'000;
 
-                // The current cycle began before this callback was entered (same clock): kills a
-                // next-cycle time, which lies about one period ahead. Margin: see the review.
+                // The cycle start, on CLOCK_MONOTONIC, against CLOCK_MONOTONIC at callback entry:
+                // lead = cycle - entry in [-(2 periods + 1 ms), +1 ms].
+                // Upper: the current cycle began before its callback was entered; +1 ms covers the
+                // DLL prediction running ahead of the wakeup (measured max +184 us, WSL, and +47 us,
+                // CI, 2026-11-11). Kills a next-cycle time (one period ahead).
+                // Lower: one period, the callback runs inside its own cycle; one more, a late cycle
+                // is followed back to back by the next (the timed dummy driver does not wait when
+                // behind), which can start a further period late; +1 ms, the same margin. Measured
+                // min -717 us (WSL) and -445 us (CI) with the clock shim, 2026-11-11.
+                // Kills a stale cycle time and a time left on CLOCK_MONOTONIC_RAW, or converted with
+                // the wrong sign, whenever |MONOTONIC - RAW| exceeds 2 periods + 1 ms (11.7 ms at
+                // 48 kHz/256; measured 425-451 ms on the GitHub Ubuntu runners, 2026-11-11).
                 const auto lead = r[i].cyc.timeNs - r[i].nowNs;
+                const auto period = (int64_t) r[i].numSamples * 1'000'000'000 / 48000;
                 minLead = std::min (minLead, lead);
                 maxLead = std::max (maxLead, lead);
-                precedesEntry = precedesEntry && lead <= 1'000'000;
+                const bool ok = lead <= 1'000'000 && lead >= -(2 * period + 1'000'000);
+                inWindow = inWindow && ok;
+                if (! ok && outside++ < 3) std::printf ("   outside the window at %zu: lead %lld ns\n", i, (long long) lead);
 
                 if (i > 0 && r[i - 1].cycP)
                 {
                     const auto d = r[i].cyc.timeNs - r[i - 1].cyc.timeNs;
-                    // An exact repeat less than 1 ms after the previous callback is tolerated (a
-                    // catch-up read of an unchanged cycle time); time never runs backwards.
-                    const bool repeat = d == 0 && r[i].nowNs - r[i - 1].nowNs < 1'000'000;
+                    // A repeat (a catch-up read of an unchanged cycle time) less than 1 ms after the
+                    // previous callback is tolerated. Converted from RAW, a repeat differs by the
+                    // change in the per-callback MONOTONIC - RAW reading, so it is |d| < 1 ms, not
+                    // d == 0; anything else must increase.
+                    const bool repeat = std::abs (d) < 1'000'000 && r[i].nowNs - r[i - 1].nowNs < 1'000'000;
                     increasing = increasing && (d > 0 || repeat);
                     repeats += repeat;
                     if (d <= 0 && ! repeat) std::printf ("   non-increasing at %zu: d=%lld ns, now-delta %lld\n", i, (long long) d, (long long) (r[i].nowNs - r[i - 1].nowNs));
@@ -278,9 +296,8 @@ int main (int argc, char** argv)
             }
             std::printf ("cycle time - callback entry: min %lld ns, max %lld ns\n", (long long) minLead, (long long) maxLead);
             check (offsetsZero, "processingCycle offset is always 0 and flags 0");
-            check (increasing, "processingCycle times strictly increase (" + String (repeats) + " exact catch-up repeats < 1 ms apart)");
-            check (nearNow, "processingCycle.timeNs within 100 ms of CLOCK_MONOTONIC at callback entry");
-            check (precedesEntry, "processingCycle.timeNs is not after callback entry (1 ms margin)");
+            check (increasing, "processingCycle times increase (" + String (repeats) + " catch-up repeats < 1 ms apart)");
+            check (inWindow, "processingCycle.timeNs - callback entry in [-(2 periods + 1 ms), +1 ms] (" + String (outside) + " outside)");
             spans ([] (const Rec& x) { return x.cycP; }, [] (const Rec& x) { return x.cyc; }, false, "cycle");
         }
     }

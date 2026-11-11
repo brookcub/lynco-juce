@@ -73,6 +73,9 @@
 #include "audio_io/juce_SampleRateHelpers.cpp"
 #include "audio_io/juce_StreamFrameTimes.h"
 #include "audio_io/juce_CallbackTimeHelpers.cpp"
+#if JUCE_UNIT_TESTS
+ #include "audio_io/juce_CallbackTimeHelpers_test.cpp"
+#endif
 #include "midi_io/juce_MidiDevices.cpp"
 
 //==============================================================================

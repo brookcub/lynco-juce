@@ -92,6 +92,9 @@ struct AudioIODeviceTimestamp
 
     | Backend                | inputStream                                       | outputStream                                       | processingCycle           |
     |------------------------|---------------------------------------------------|----------------------------------------------------|---------------------------|
+    | WASAPI                 | GetBuffer: the capture time of the first frame of | IAudioClock::GetPosition: the frame playing at the | -                         |
+    |                        | the packet holding the callback's first real      | reported time (observation)                        |                           |
+    |                        | sample (observation)                              |                                                    |                           |
     | all others             | -                                                 | -                                                  | -                         |
 
     An observation never crosses a stop: audioDeviceAboutToStart and audioDeviceStopped

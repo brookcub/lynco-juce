@@ -129,7 +129,8 @@ enum
 enum
 {
     AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY = 1,
-    AUDCLNT_BUFFERFLAGS_SILENT = 2
+    AUDCLNT_BUFFERFLAGS_SILENT = 2,
+    AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR = 4
 };
 
 JUCE_IUNKNOWNCLASS (IPropertyStore, "886d8eeb-8cf2-4446-8d02-cdba1dbdcf99")
@@ -263,6 +264,13 @@ JUCE_IUNKNOWNCLASS (IAudioCaptureClient, "C8ADBD64-E71E-48a0-A4DE-185C395CD317")
     JUCE_COMCALL GetNextPacketSize (UINT32*) = 0;
 };
 
+JUCE_IUNKNOWNCLASS (IAudioClock, "CD63314F-3FBA-4a1b-812C-EF96358728E7")
+{
+    JUCE_COMCALL GetFrequency (UINT64*) = 0;
+    JUCE_COMCALL GetPosition (UINT64*, UINT64*) = 0;
+    JUCE_COMCALL GetCharacteristics (DWORD*) = 0;
+};
+
 JUCE_IUNKNOWNCLASS (IAudioRenderClient, "F294ACFC-3146-4483-A7BF-ADDCA7C260E2")
 {
     JUCE_COMCALL GetBuffer (UINT32, BYTE**) = 0;
@@ -345,6 +353,7 @@ __CRT_UUID_DECL (juce::IAudioClient,          0x1CB9AD4C, 0xDBFA, 0x4c32, 0xB1, 
 __CRT_UUID_DECL (juce::IAudioClient2,         0x726778CD, 0xF60A, 0x4eda, 0x82, 0xDE, 0xE4, 0x76, 0x10, 0xCD, 0x78, 0xAA)
 __CRT_UUID_DECL (juce::IAudioClient3,         0x1CB9AD4C, 0xDBFA, 0x4c32, 0xB1, 0x78, 0xC2, 0xF5, 0x68, 0xA7, 0x03, 0xB2)
 __CRT_UUID_DECL (juce::IAudioCaptureClient,   0xC8ADBD64, 0xE71E, 0x48a0, 0xA4, 0xDE, 0x18, 0x5C, 0x39, 0x5C, 0xD3, 0x17)
+__CRT_UUID_DECL (juce::IAudioClock,           0xCD63314F, 0x3FBA, 0x4a1b, 0x81, 0x2C, 0xEF, 0x96, 0x35, 0x87, 0x28, 0xE7)
 __CRT_UUID_DECL (juce::IAudioRenderClient,    0xF294ACFC, 0x3146, 0x4483, 0xA7, 0xBF, 0xAD, 0xDC, 0xA7, 0xC2, 0x60, 0xE2)
 __CRT_UUID_DECL (juce::IAudioEndpointVolume,  0x5CDF2C82, 0x841E, 0x4546, 0x97, 0x22, 0x0C, 0xF7, 0x40, 0x78, 0x22, 0x9A)
 __CRT_UUID_DECL (juce::IAudioSessionEvents,   0x24918ACC, 0x64B3, 0x37C1, 0x8C, 0xA9, 0x74, 0xA6, 0x6E, 0x99, 0x57, 0xA8)
@@ -929,6 +938,175 @@ private:
 };
 
 //==============================================================================
+/*  Which capture packet each queued input frame came from, so that a callback can carry the
+    observation of the packet that holds its first real sample.
+
+    GetBuffer stamps every packet with the QPC time (in 100 ns units) at which its first frame
+    was captured, and its discontinuity and timestamp-error flags. Packets are appended to the
+    queue in order; a callback takes the oldest queued frames, after padding if fewer are queued
+    than it needs. The observation is that packet's own time and the position of its first frame
+    relative to the callback's buffer, so a packet split across callbacks keeps its time and
+    appears at a negative offset in the later ones, and a packet after leading padding appears at
+    a positive offset. Nothing is projected between packets.
+*/
+class CapturePacketLedger
+{
+public:
+    /*  Forgets every packet. Called when the stream starts, with the most frames the queue can hold,
+        so no observation crosses a start and nothing allocates afterwards.
+    */
+    void reset (int queueCapacity)
+    {
+        // Every packet holds at least one frame, so this many entries cover every queued frame
+        packets.assign ((size_t) jmax (1, queueCapacity) + 1, Packet());
+        numFramesAdded = 0;
+        newest = 0;
+    }
+
+    /*  Records a packet whose numFrames frames have just been appended to the queue, with the flags
+        and QPC position that GetBuffer returned for it. The newest queued frame is always the last
+        frame of the newest packet recorded.
+    */
+    void addPacket (int numFrames, DWORD flags, UINT64 qpcPosition) noexcept
+    {
+        if (packets.empty() || numFrames <= 0)
+            return;
+
+        uint32_t nativeFlags = 0;
+
+        if ((flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0)  nativeFlags |= AudioIODeviceTimestamp::nativeDiscontinuity;
+        if ((flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) != 0)     nativeFlags |= AudioIODeviceTimestamp::nativeTimestampError;
+
+        newest = (newest + 1) % packets.size();
+
+        // GetBuffer's position is in units of 100 ns, so this is exact
+        packets[newest] = { numFramesAdded, numFrames, (int64_t) qpcPosition * 100, nativeFlags };
+        numFramesAdded += numFrames;
+    }
+
+    /*  Called as a callback takes its input: numQueued frames are queued, and the callback's buffer
+        of numWanted frames starts with max (0, numWanted - numQueued) frames of padding followed by
+        the oldest queued frames. Forgets the frames taken, and returns the observation of the packet
+        that holds the buffer's first real sample: its time in ns, the offset of its first frame from
+        the start of the buffer, and nativeDiscontinuity and nativeTimestampError from its flags.
+
+        Returns nullopt if the buffer has no real sample, or if that sample is older than every
+        recorded packet (its packet is unknown).
+    */
+    std::optional<AudioIODeviceTimestamp> takeFrames (int numQueued, int numWanted) noexcept
+    {
+        if (numQueued <= 0 || numWanted <= 0)
+            return {};
+
+        // The queue holds the newest numQueued frames added, so counting back from the newest
+        // finds the oldest, which is the buffer's first real sample
+        const auto firstReal = numFramesAdded - numQueued;
+        const auto numPadding = jmax (0, numWanted - numQueued);
+
+        for (size_t i = 0; i < packets.size(); ++i)
+        {
+            const auto& packet = packets[(newest + packets.size() - i) % packets.size()];
+
+            if (packet.numFrames == 0)
+                break;
+
+            if (packet.firstFrame <= firstReal)
+            {
+                if (firstReal >= packet.firstFrame + packet.numFrames)
+                    return {};
+
+                return AudioIODeviceTimestamp { packet.timeNs, packet.firstFrame - firstReal + numPadding, packet.nativeFlags };
+            }
+        }
+
+        return {};
+    }
+
+private:
+    struct Packet
+    {
+        int64_t firstFrame = 0; // counted from the start, in the same count as numFramesAdded
+        int numFrames = 0;
+        int64_t timeNs = 0;
+        uint32_t nativeFlags = 0;
+    };
+
+    std::vector<Packet> packets; // a ring, the newest packet at `newest`
+    int64_t numFramesAdded = 0;
+    size_t newest = 0;
+};
+
+/*  The output observation from one IAudioClock::GetPosition reading: the stream position that was
+    playing (units of 1 / clockFrequency s) at qpcPosition (100 ns units). The position is x =
+    position * applicationSampleRate / clockFrequency frames of the stream, aligned to the nearest
+    frame by CallbackTimeHelpers::alignToApplicationSample, once. callbackStart is the stream
+    position, in frames, of the callback's first output frame, from the count of frames submitted,
+    or nullopt where that correspondence is not established (for example across a reset).
+
+    getPositionResult S_FALSE gives nativeReducedAccuracy. A failed reading, a zero frequency or an
+    unknown callbackStart gives nullopt.
+
+*/
+inline std::optional<AudioIODeviceTimestamp> getRenderTimestamp (HRESULT getPositionResult,
+                                                                 UINT64 position,
+                                                                 UINT64 qpcPosition,
+                                                                 UINT64 clockFrequency,
+                                                                 int64_t applicationSampleRate,
+                                                                 std::optional<int64_t> callbackStart) noexcept
+{
+    if (FAILED (getPositionResult) || clockFrequency == 0 || clockFrequency > (UINT64) std::numeric_limits<int32_t>::max()
+         || ! callbackStart.has_value())
+        return {};
+
+    // The stream position, in frames, is position * rate / frequency; qpcPosition is in units of 100 ns
+    const auto aligned = CallbackTimeHelpers::alignToApplicationSample ((int64_t) qpcPosition * 100, (int64_t) position,
+                                                                        applicationSampleRate, (int64_t) clockFrequency,
+                                                                        applicationSampleRate);
+
+    return AudioIODeviceTimestamp { aligned.timeNs,
+                                    aligned.position - *callbackStart,
+                                    getPositionResult == S_FALSE ? AudioIODeviceTimestamp::nativeReducedAccuracy : 0u };
+}
+
+/*  SPEC "WASAPI render after underrun: hardware result". Which stream frame the next callback's
+    first output frame is, for getRenderTimestamp's callbackStart, from the render loop's own
+    bookkeeping; and whether that correspondence still holds.
+
+    reset()               the device opens or the stream (re)starts: nothing released, correspondence held
+    released (n)          n frames given to ReleaseBuffer, in stream order (start()'s silence included)
+    paddingBeforeWrite(p) a GetCurrentPadding reading taken before a write. Once any frame has been
+                          released, p == 0 means the engine ran dry: a render underrun.
+    lose()                any other detected loss (e.g. a clock position ahead of the frames released)
+
+    callbackStart() is the number of frames released so far, or nullopt from the first underrun or
+    loss until reset(): after an underrun the clock's (position, QPC) pair no longer matches
+    presentation (measured: 8-16 ms off), so the output role stays absent until the stream
+    restarts. The input role does not use this.
+
+    How the backend feeds it (SPEC "Rulings on the prosecution review", F1 and F3): the class
+    does not know the share mode or which write is the first, so nothing may be filtered on
+    the way in. Every successful GetCurrentPadding taken before a write goes to
+    paddingBeforeWrite, in shared and exclusive mode alike, the first application write after
+    start()'s silence included (an engine that ran dry before the first block is an underrun
+    too); a padding that cannot be read before a write is a lose().
+
+    Implementers may add private members; the public interface is fixed.
+*/
+class RenderStreamCorrespondence
+{
+public:
+    void reset() noexcept                                     { numReleased = 0; isLost = false; }
+    void released (int64_t numFrames) noexcept                { numReleased += numFrames; }
+    void paddingBeforeWrite (int64_t paddingFrames) noexcept  { if (paddingFrames == 0 && numReleased > 0) isLost = true; }
+    void lose() noexcept                                      { isLost = true; }
+    std::optional<int64_t> callbackStart() const noexcept     { return isLost ? std::nullopt : std::optional<int64_t> (numReleased); }
+
+private:
+    int64_t numReleased = 0;
+    bool isLost = false;
+};
+
+//==============================================================================
 class WASAPIInputDevice final : public WASAPIDeviceBase
 {
 public:
@@ -975,6 +1153,7 @@ public:
 
         queue = SingleThreadedAbstractFifo (reservoirSize);
         reservoir.setSize ((size_t) (queue.getSize() * bytesPerFrame), true);
+        ledger.reset (queue.getSize());
         xruns = 0;
 
         if (! check (client->Start()))
@@ -1006,8 +1185,9 @@ public:
         uint8* inputData = nullptr;
         UINT32 numSamplesAvailable = 0;
         DWORD flags = 0;
+        UINT64 qpcPosition = 0;
 
-        while (check (captureClient->GetBuffer (&inputData, &numSamplesAvailable, &flags, nullptr, nullptr)) && numSamplesAvailable > 0)
+        while (check (captureClient->GetBuffer (&inputData, &numSamplesAvailable, &flags, nullptr, &qpcPosition)) && numSamplesAvailable > 0)
         {
             if ((flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0)
                 xruns++;
@@ -1034,15 +1214,18 @@ public:
                 offset += block.getLength();
             }
 
+            ledger.addPacket ((int) numSamplesAvailable, flags, qpcPosition);
             captureClient->ReleaseBuffer (numSamplesAvailable);
         }
     }
 
-    void copyBuffersFromReservoir (float* const* destBuffers, const int numDestBuffers, const int bufferSize)
+    /** Returns the observation of the packet holding the first real sample copied, or nothing if it isn't known. */
+    std::optional<AudioIODeviceTimestamp> copyBuffersFromReservoir (float* const* destBuffers, const int numDestBuffers, const int bufferSize)
     {
         if ((numChannels <= 0 && bufferSize == 0) || reservoir.isEmpty())
-            return;
+            return {};
 
+        const auto time = ledger.takeFrames (queue.getNumReadable(), bufferSize);
         auto offset = jmax (0, bufferSize - queue.getNumReadable());
 
         if (offset > 0)
@@ -1060,11 +1243,14 @@ public:
 
             offset += block.getLength();
         }
+
+        return time;
     }
 
     ComSmartPtr<IAudioCaptureClient> captureClient;
     MemoryBlock reservoir;
     SingleThreadedAbstractFifo queue;
+    CapturePacketLedger ledger;
     int xruns = 0;
 
     std::unique_ptr<AudioData::Converter> converter;
@@ -1086,15 +1272,68 @@ public:
 
     bool open (double newSampleRate, const BigInteger& newChannels, int bufferSizeSamples)
     {
-        return openClient (newSampleRate, newChannels, bufferSizeSamples)
+        correspondence.reset();
+
+        if (! (openClient (newSampleRate, newChannels, bufferSizeSamples)
                 && (numChannels == 0 || check (client->GetService (__uuidof (IAudioRenderClient),
-                                                                   (void**) renderClient.resetAndGetPointerAddress())));
+                                                                   (void**) renderClient.resetAndGetPointerAddress())))))
+            return false;
+
+        // Without the clock the device still plays, but callbacks get no output observation
+        if (numChannels > 0
+             && check (client->GetService (__uuidof (IAudioClock), (void**) audioClock.resetAndGetPointerAddress()))
+             && (! check (audioClock->GetFrequency (&clockFrequency)) || clockFrequency == 0))
+            audioClock = nullptr;
+
+        return true;
     }
 
     void close()
     {
         closeClient();
         renderClient = nullptr;
+        audioClock = nullptr;
+    }
+
+    /*  Every frame this device releases to the render client, from the silence in start() on,
+        is part of one stream, and copyBuffers releases the frames of a callback in order, one
+        native write after another, however many it takes. So the first frame of the next
+        callback is the frame at index correspondence.callbackStart() in that stream, whether the
+        callback's frames then go out in one write or several, whether the wait for space is in
+        shared mode (the engine's padding) or exclusive mode (the event), and in low-latency mode,
+        which is a shared stream.
+
+        IAudioClock's position counts the frames of that stream that have been presented, and
+        while the application keeps the engine supplied its (position, QPC) pair is the stream's
+        presentation. Measured on a shared-mode render stream, after the application has run dry
+        the position stays put while the engine plays silence of its own and carries on from the
+        same place, but its pair no longer matches presentation (the output ends up 8-16 ms off,
+        for the rest of the run). So from the first write that finds the engine's buffer empty
+        (the first one after start()'s silence included: an engine that has run dry before the
+        application's first block is not presenting that stream), or if a position is ever ahead of
+        the frames released, or if the padding cannot be read, the clock has counted something that
+        is not in the stream, and the observation is absent until the device is opened again.
+        Every padding read before a write goes to the correspondence, in either share mode (in
+        exclusive mode it is read after the event, before the write, for this and nothing else).
+        The input role is not affected and does not depend on this.
+
+        Nothing is projected: the observation is the clock's own pair, aligned to the nearest
+        frame by getRenderTimestamp.
+    */
+    std::optional<AudioIODeviceTimestamp> getTimestampOfNextBuffer()
+    {
+        UINT64 position = 0, qpc = 0;
+
+        if (audioClock == nullptr)
+            return {};
+
+        const auto result = audioClock->GetPosition (&position, &qpc);
+
+        if (SUCCEEDED (result) && isAheadOfReleasedFrames (position))
+            correspondence.lose();
+
+        return getRenderTimestamp (result, position, qpc, clockFrequency, std::llround (sampleRate),
+                                   correspondence.callbackStart());
     }
 
     template <class DestType>
@@ -1118,7 +1357,10 @@ public:
         uint8* outputData;
 
         if (check (renderClient->GetBuffer ((UINT32) samplesToDo, &outputData)))
+        {
             renderClient->ReleaseBuffer ((UINT32) samplesToDo, AUDCLNT_BUFFERFLAGS_SILENT);
+            correspondence.released (samplesToDo);
+        }
 
         if (! check (client->Start()))
             return false;
@@ -1128,18 +1370,31 @@ public:
         return true;
     }
 
-    int getNumSamplesAvailableToCopy() const
+    // The engine's padding before the write that follows, for the correspondence; nullopt (and the
+    // correspondence lost) if it cannot be read
+    std::optional<UINT32> readPaddingBeforeWrite()
+    {
+        UINT32 padding = 0;
+
+        if (check (client->GetCurrentPadding (&padding)))
+        {
+            correspondence.paddingBeforeWrite (padding);
+            return padding;
+        }
+
+        correspondence.lose();
+        return {};
+    }
+
+    // Shared mode writes what the engine has room for; exclusive mode the whole buffer, after the event
+    int getNumSamplesAvailableToCopy()
     {
         if (numChannels <= 0)
             return 0;
 
         if (! isExclusiveMode (deviceMode))
-        {
-            UINT32 padding = 0;
-
-            if (check (client->GetCurrentPadding (&padding)))
-                return (int) actualBufferSize - (int) padding;
-        }
+            if (const auto padding = readPaddingBeforeWrite())
+                return (int) actualBufferSize - (int) *padding;
 
         return (int) actualBufferSize;
     }
@@ -1170,8 +1425,13 @@ public:
                 break;
             }
 
-            if (isExclusiveMode (deviceMode) && WaitForSingleObject (clientEvent, 1000) == WAIT_TIMEOUT)
-                break;
+            if (isExclusiveMode (deviceMode))
+            {
+                if (WaitForSingleObject (clientEvent, 1000) == WAIT_TIMEOUT)
+                    break;
+
+                readPaddingBeforeWrite();
+            }
 
             const auto numChannelsToCopy = jmin (actualNumChannels, numSrcBuffers);
             jassert (numChannelsToCopy <= channelMaps.size());
@@ -1183,6 +1443,7 @@ public:
                     converter->convertSamples (outputData, channelMaps.getUnchecked (i), srcBuffers[i] + offset, 0, samplesToDo);
 
                 renderClient->ReleaseBuffer ((UINT32) samplesToDo, 0);
+                correspondence.released (samplesToDo);
             }
 
             bufferSize -= samplesToDo;
@@ -1190,7 +1451,19 @@ public:
         }
     }
 
+    bool isAheadOfReleasedFrames (UINT64 position) const noexcept
+    {
+        // position / frequency seconds of the stream, in whole frames
+        const auto rate = (UINT64) std::llround (sampleRate);
+        const auto frames = (position / clockFrequency) * rate + (position % clockFrequency) * rate / clockFrequency;
+
+        return frames > (UINT64) correspondence.callbackStart().value_or (std::numeric_limits<int64_t>::max());
+    }
+
     ComSmartPtr<IAudioRenderClient> renderClient;
+    ComSmartPtr<IAudioClock> audioClock;
+    UINT64 clockFrequency = 0;
+    RenderStreamCorrespondence correspondence;
     std::unique_ptr<AudioData::Converter> converter;
 
 private:
@@ -1556,6 +1829,8 @@ public:
             if (! inputDeviceActive && ! outputDeviceActive)
                 continue;
 
+            std::optional<AudioIODeviceTimestamp> inputTime;
+
             if (inputDeviceActive)
             {
                 if (outputDevice == nullptr)
@@ -1574,7 +1849,7 @@ public:
                         inputDevice->handleDeviceBuffer();
                 }
 
-                inputDevice->copyBuffersFromReservoir (ins.getArrayOfWritePointers(), numInputBuffers, bufferSize);
+                inputTime = inputDevice->copyBuffersFromReservoir (ins.getArrayOfWritePointers(), numInputBuffers, bufferSize);
             }
 
             {
@@ -1582,12 +1857,17 @@ public:
 
                 if (sl.isLocked() && (loadedFlags & flagStarted) != 0)
                 {
+                    const auto outputTime = outputDeviceActive ? outputDevice->getTimestampOfNextBuffer()
+                                                               : std::nullopt;
+                    const auto pointerTo = [] (const std::optional<AudioIODeviceTimestamp>& time) { return time.has_value() ? &*time : nullptr; };
+
+                    // hostTimeNs stays empty, as in stock JUCE; the device's own observations travel in the roles
                     callback->audioDeviceIOCallbackWithContext (ins.getArrayOfReadPointers(),
                                                                 numInputBuffers,
                                                                 outs.getArrayOfWritePointers(),
                                                                 numOutputBuffers,
                                                                 bufferSize,
-                                                                {});
+                                                                { nullptr, pointerTo (inputTime), pointerTo (outputTime), nullptr });
                 }
                 else
                 {
@@ -2092,3 +2372,7 @@ bool  JUCE_CALLTYPE SystemAudioVolume::setMuted (bool mute)   { return WasapiCla
 JUCE_END_IGNORE_WARNINGS_GCC_LIKE
 
 } // namespace juce
+
+#if JUCE_UNIT_TESTS
+ #include "juce_WASAPI_windows_test.cpp"
+#endif

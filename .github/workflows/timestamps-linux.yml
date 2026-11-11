@@ -1,0 +1,91 @@
+name: timestamps-linux
+
+# Builds UnitTestRunner with ALSA and JACK, runs the timestamp suites, then opens a JACK dummy
+# server and (if snd-aloop loads) ALSA loopback devices through AudioDeviceManager and checks the
+# device-timestamp roles. Triggered by pushes to this branch only.
+on:
+  push:
+    branches: [ci/timestamps-linux]
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build and test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build libasound2-dev libjack-jackd2-dev jackd2 alsa-utils \
+            libfreetype-dev libfontconfig1-dev libx11-dev libxext-dev libxinerama-dev libxrandr-dev libxcursor-dev libcurl4-openssl-dev
+
+      - name: Build UnitTestRunner
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DJUCE_BUILD_EXTRAS=ON -DCMAKE_CXX_FLAGS="-DJUCE_JACK=1 -DJUCE_ALSA=1"
+          cmake --build build --target UnitTestRunner 2>&1 | tee build.log
+          grep -E "warning:" build.log | grep -E "juce_ALSA_linux|juce_JackAudio|juce_CallbackTimeHelpers" || true
+
+      # Other lanes' seams are still stubs here, so the runner's exit code is not the gate: the
+      # suites of this lane (and the shared ones) must have no failure in the summary.
+      - name: Run the Audio tests
+        run: |
+          app=build/extras/UnitTestRunner/UnitTestRunner_artefacts/Release/UnitTestRunner
+          "$app" --category=Audio > utr.log 2>&1 || true
+          grep -c "^Completed tests in" utr.log
+          for s in "ALSA device timestamps" "JACK processing cycle timestamps" "Callback timestamp alignment" "AudioDeviceManager"; do
+            echo "$s: $(grep -c "^Completed tests in $s" utr.log) cases completed"
+          done
+          sed -n '/Test failure summary/,$p' utr.log
+          if sed -n '/Test failure summary/,$p' utr.log | grep -E "^(ALSA|JACK|Callback timestamp|AudioDeviceManager)"; then exit 1; fi
+          test "$(grep -c '^Completed tests in ALSA device timestamps' utr.log)" -eq 5
+          test "$(grep -c '^Completed tests in JACK processing cycle timestamps' utr.log)" -eq 2
+
+      - name: Build the integration harness
+        run: |
+          cmake -S .github/ci/ts-harness -B hbuild -G Ninja -DCMAKE_BUILD_TYPE=Release -DJUCE_SRC="$PWD"
+          cmake --build hbuild
+
+      # The server's clock decides the role (SPEC ruling 8): present when it agrees with
+      # CLOCK_MONOTONIC within 1 ms, otherwise absent in every callback. "auto" accepts either
+      # outcome and checks it fully.
+      - name: JACK dummy server
+        run: |
+          export JACK_NO_AUDIO_RESERVATION=1
+          jackd -d dummy -r 48000 -p 256 > jackd.log 2>&1 &
+          JP=$!
+          sleep 3
+          ./hbuild/ts-harness_artefacts/Release/ts-harness list || true
+          ./hbuild/ts-harness_artefacts/Release/ts-harness jack 20 auto
+          kill $JP
+
+      # Wiring check only: CLOCK_MONOTONIC reads as CLOCK_MONOTONIC_RAW in the client process, which
+      # is the clock jackd2 uses.
+      - name: JACK dummy server, client clock shimmed to CLOCK_MONOTONIC_RAW
+        run: |
+          export JACK_NO_AUDIO_RESERVATION=1
+          g++ -shared -fPIC -x c++ .github/ci/ts-harness/rawshim.c -o rawshim.so -ldl
+          jackd -d dummy -r 48000 -p 256 > jackd2.log 2>&1 &
+          JP=$!
+          sleep 3
+          LD_PRELOAD=$PWD/rawshim.so ./hbuild/ts-harness_artefacts/Release/ts-harness jack 20
+          kill $JP
+
+      - name: ALSA loopback (snd-aloop)
+        run: |
+          sudo apt-get install -y -qq "linux-modules-extra-$(uname -r)" || echo "no linux-modules-extra for this kernel"
+          if ! sudo modprobe snd-aloop pcm_substreams=2; then
+            echo "SND-ALOOP-UNAVAILABLE: modprobe snd-aloop failed on this runner; ALSA integration not run"
+            uname -r; exit 0
+          fi
+          cat /proc/asound/cards
+          cat > ~/.asoundrc <<'EOF'
+          pcm.tsloop_out { type hw  card Loopback  device 0  subdevice 0  hint { show on  description "TS loop out" } }
+          pcm.tsloop_in  { type hw  card Loopback  device 1  subdevice 0  hint { show on  description "TS loop in" } }
+          pcm.tsplug_out { type plug  slave.pcm "hw:Loopback,0,1"  hint { show on  description "TS plug out" } }
+          pcm.tsplug_in  { type plug  slave.pcm "hw:Loopback,1,1"  hint { show on  description "TS plug in" } }
+          EOF
+          H=./hbuild/ts-harness_artefacts/Release/ts-harness
+          $H list
+          $H alsa "TS loop out" "TS loop in" 20
+          $H alsa "TS plug out" "TS plug in" 10 absent

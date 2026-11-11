@@ -82,6 +82,7 @@ int main()
     const auto inputName = String ("BlackHole 2ch"), outputName = String ("BlackHole 16ch");
 
     AudioDeviceManager manager;
+    manager.getAvailableDeviceTypes();    // creates the device types
     manager.setCurrentAudioDeviceType ("CoreAudio", true);
 
     auto* type = manager.getCurrentDeviceTypeObject();

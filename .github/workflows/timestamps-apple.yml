@@ -3,7 +3,7 @@ name: timestamps-apple
 # Native timestamp forwarding on Apple platforms (P014.1, P020). Push-triggered on this branch only.
 on:
   push:
-    branches: [ci/timestamps-combined]
+    branches: [ci/timestamps-combined, ci/timestamps-rails]
 
 jobs:
   unit-tests:
@@ -50,10 +50,19 @@ jobs:
           grep -qE "CompileC .*juce_audio_devices\.mm" build-ios.log
 
   combined-device:
+    strategy:
+      fail-fast: false
+      matrix:
+        # The kill check for the absolute association rail (RAILS.md, amendment 2026-11-11): one
+        # buffer added to the combiner's output offset must fail that check, and only that check.
+        mutant: [ none, combiner-offset-plus-buffer ]
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - name: Apply the mutant
+        if: matrix.mutant != 'none'
+        run: git apply .github/ci/timestamps-apple/mutant-${{ matrix.mutant }}.patch
       - name: Install two virtual HAL devices
         run: |
           sw_vers
@@ -68,8 +77,21 @@ jobs:
           command -v ninja || brew install ninja
           cmake -S .github/ci/timestamps-apple -B build-check -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build-check --target CombinedDeviceCheck 2>&1 | tee build-check.log
-      - name: Run the check
+      - name: Run the check three times
+        shell: bash
         run: |
           app=$(find build-check -name CombinedDeviceCheck -type f -perm -u+x | head -n 1)
           echo "Running $app"
-          "$app"
+          status=0
+          for run in 1 2 3; do
+            echo "=== run $run"
+            "$app" | tee run$run.log || status=1
+          done
+          if [ "${{ matrix.mutant }}" = none ]; then exit $status; fi
+          # The mutant must fail every run, on the absolute check alone
+          for run in 1 2 3; do
+            grep '^FAIL' run$run.log || true
+            test "$(grep -c '^FAIL' run$run.log)" -eq 1
+            grep -q '^FAIL  outputStream predicts each marker' run$run.log
+          done
+          echo "MUTANT KILLED in every run"

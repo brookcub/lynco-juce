@@ -1,0 +1,23 @@
+diff --git a/modules/juce_audio_devices/native/juce_CoreAudio_mac.cpp b/modules/juce_audio_devices/native/juce_CoreAudio_mac.cpp
+index 4ccaa528ed..6564752d17 100644
+--- a/modules/juce_audio_devices/native/juce_CoreAudio_mac.cpp
++++ b/modules/juce_audio_devices/native/juce_CoreAudio_mac.cpp
+@@ -1918,14 +1918,17 @@ private:
+ 
+                 // The output device's stamp, for the FIFO address this buffer is about to be written to
+                 const auto plannedWritePos = writePos.load();
+-                const auto outputStream = numActiveOutputChannels > 0 && plannedWritePos != invalidSampleTime
++                auto outputStream = numActiveOutputChannels > 0 && plannedWritePos != invalidSampleTime
+                                         ? outputCorrespondence.observationFor (plannedWritePos)
+                                         : std::nullopt;
+ 
+                 auto combinedContext = CallbackTimeHelpers::getCombinedCallbackContext (context);
+ 
+                 if (outputStream.has_value())
++                {
++                    outputStream->sampleOffset += n;    // MUTANT: one buffer added to the combiner's output offset
+                     combinedContext.outputStream = &*outputStream;
++                }
+ 
+                 callback->audioDeviceIOCallbackWithContext (channels,
+                                                             numChannels,

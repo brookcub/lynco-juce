@@ -65,6 +65,18 @@ public:
     }
 
     /**
+     * The failure of the most recent native read, or Result::OK. The flowgraph can only
+     * carry frame counts, so this is how a failed read reaches DataConversionFlowGraph::read().
+     */
+    oboe::Result getReadError() const {
+        return mReadError;
+    }
+
+    void clearReadError() {
+        mReadError = oboe::Result::OK;
+    }
+
+    /**
      * Called internally for block size adaptation.
      * @param buffer
      * @param numBytes
@@ -75,6 +87,7 @@ public:
 protected:
     oboe::AudioStream         *mStream = nullptr;
     int64_t                    mTimeoutNanos = 0;
+    oboe::Result               mReadError = oboe::Result::OK;
 
     FixedBlockReader           mBlockReader;
 };

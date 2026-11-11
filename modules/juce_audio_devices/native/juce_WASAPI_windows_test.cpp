@@ -36,8 +36,8 @@
 namespace juce::WasapiClasses
 {
 
-/*  Acceptance tests for P009.1 (WASAPI device timestamps). Builders implement CapturePacketLedger
-    and getRenderTimestamp; they do not edit these tests. Packet QPC positions are in GetBuffer's
+/*  Acceptance tests for P009.1 (WASAPI device timestamps). Builders implement CapturePacketLedger,
+    getRenderTimestamp and RenderStreamCorrespondence; they do not edit these tests. Packet QPC positions are in GetBuffer's
     100 ns units, so 1,000,000 is 100,000,000 ns. Every expected value is worked by hand from the
     fake packets: a packet's own time, and its first frame's position counted from the callback's
     first frame. Render expectations are exact fractions, checked with Python's fractions.Fraction
@@ -232,6 +232,86 @@ public:
             // which rounds to 1,990,656,000,000, exactly 100 ns earlier
             expectTimestamp (getRenderTimestamp (S_OK, 103'680'000'000'001, 90'000'000'000, 10'000'000, 192000, 1'990'656'000'480),
                              Ts { 8'999'999'999'900, -480, 0 });
+        }
+
+        // RenderStreamCorrespondence: frame counts as in the Focusrite run (hw-windows/RESULTS.md):
+        // a 1056-frame endpoint buffer filled with silence at start, then 480-frame writes.
+        beginTest ("Render bookkeeping: the next callback starts at the count of frames released");
+        {
+            RenderStreamCorrespondence stream;
+            stream.reset();
+            stream.paddingBeforeWrite (0);    // start(): the endpoint buffer is still empty, nothing released yet
+            stream.released (1056);
+            expect (stream.callbackStart() == std::optional<int64_t> (1056));
+            stream.paddingBeforeWrite (576);
+            stream.released (480);
+            stream.paddingBeforeWrite (96);
+            stream.released (480);
+            expect (stream.callbackStart() == std::optional<int64_t> (2016));
+
+            // through getRenderTimestamp: position 1536 frames at 200 ms, callback at 2016
+            expectTimestamp (getRenderTimestamp (S_OK, 1536, 2'000'000, 48'000, 48000, stream.callbackStart()), Ts { 200'000'000, -480, 0 });
+        }
+
+        beginTest ("Render bookkeeping: padding found empty before a write is an underrun, and the role stays absent");
+        {
+            RenderStreamCorrespondence stream;
+            stream.reset();
+            stream.released (1056);
+            stream.paddingBeforeWrite (576);
+            stream.released (480);
+            stream.paddingBeforeWrite (0);    // the engine ran dry
+            expect (! stream.callbackStart().has_value(), "an underrun must make the callback position unknown");
+            expectAbsent (getRenderTimestamp (S_OK, 1536, 2'000'000, 48'000, 48000, stream.callbackStart()));
+
+            // latched: later writes with a full buffer do not bring it back
+            for (int i = 0; i < 100; ++i)
+            {
+                stream.released (480);
+                stream.paddingBeforeWrite (576);
+            }
+
+            expect (! stream.callbackStart().has_value(), "the role must stay absent until the stream restarts");
+        }
+
+        beginTest ("Render bookkeeping: a restart re-establishes the correspondence from zero");
+        {
+            RenderStreamCorrespondence stream;
+            stream.reset();
+            stream.released (1056);
+            stream.paddingBeforeWrite (0);
+            stream.released (480);
+            expect (! stream.callbackStart().has_value());
+
+            stream.reset();
+            stream.released (1056);
+            expect (stream.callbackStart() == std::optional<int64_t> (1056));
+        }
+
+        beginTest ("Render bookkeeping: any other detected loss also latches until reset");
+        {
+            RenderStreamCorrespondence stream;
+            stream.reset();
+            stream.released (1056);
+            stream.lose();
+            stream.paddingBeforeWrite (576);
+            stream.released (480);
+            expect (! stream.callbackStart().has_value());
+
+            stream.reset();
+            expect (stream.callbackStart() == std::optional<int64_t> (0));
+        }
+
+        beginTest ("Render bookkeeping: large counts");
+        {
+            // 2^40 frames (265 days at 48 kHz) in 2^20-frame writes, then one more frame
+            RenderStreamCorrespondence stream;
+            stream.reset();
+            for (int i = 0; i < (1 << 20); ++i)
+                stream.released (1 << 20);
+            stream.paddingBeforeWrite (1);
+            stream.released (1);
+            expect (stream.callbackStart() == std::optional<int64_t> (1'099'511'627'777));
         }
     }
 

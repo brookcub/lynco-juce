@@ -1068,6 +1068,33 @@ inline std::optional<AudioIODeviceTimestamp> getRenderTimestamp (HRESULT getPosi
                                     getPositionResult == S_FALSE ? AudioIODeviceTimestamp::nativeReducedAccuracy : 0u };
 }
 
+/*  SPEC "WASAPI render after underrun: hardware result". Which stream frame the next callback's
+    first output frame is, for getRenderTimestamp's callbackStart, from the render loop's own
+    bookkeeping; and whether that correspondence still holds.
+
+    reset()               the device opens or the stream (re)starts: nothing released, correspondence held
+    released (n)          n frames given to ReleaseBuffer, in stream order (start()'s silence included)
+    paddingBeforeWrite(p) a GetCurrentPadding reading taken before a write. Once any frame has been
+                          released, p == 0 means the engine ran dry: a render underrun.
+    lose()                any other detected loss (e.g. a clock position ahead of the frames released)
+
+    callbackStart() is the number of frames released so far, or nullopt from the first underrun or
+    loss until reset(): after an underrun the clock's (position, QPC) pair no longer matches
+    presentation (measured: 8-16 ms off), so the output role stays absent until the stream
+    restarts. The input role does not use this.
+
+    Implementers may add private members; the public interface is fixed.
+*/
+class RenderStreamCorrespondence
+{
+public:
+    void reset() noexcept {}                                                         // P009.1 implements
+    void released (int64_t numFrames) noexcept                { ignoreUnused (numFrames); }
+    void paddingBeforeWrite (int64_t paddingFrames) noexcept  { ignoreUnused (paddingFrames); }
+    void lose() noexcept {}
+    std::optional<int64_t> callbackStart() const noexcept     { return {}; }
+};
+
 //==============================================================================
 class WASAPIInputDevice final : public WASAPIDeviceBase
 {

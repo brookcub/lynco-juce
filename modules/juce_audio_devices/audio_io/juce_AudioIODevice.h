@@ -96,6 +96,9 @@ struct AudioIODeviceTimestamp
     |                        | from the hardware (observation)                   | passed to the hardware (prediction)                |                           |
     | CoreAudio, combined    | the input device's inInputTime                    | the output device's inOutputTime, at the frame it  | -                         |
     |                        |                                                   | read from the FIFO (prediction)                    |                           |
+    | iOS                    | -                                                 | -                                                  | the render timestamp, at  |
+    |                        |                                                   |                                                    | offset 0, with no capture |
+    |                        |                                                   |                                                    | or presentation claim     |
     | WASAPI                 | GetBuffer: the capture time of the first frame of | IAudioClock::GetPosition: the frame playing at the | -                         |
     |                        | the packet holding the callback's first real      | reported time (observation)                        |                           |
     |                        | sample (observation)                              |                                                    |                           |

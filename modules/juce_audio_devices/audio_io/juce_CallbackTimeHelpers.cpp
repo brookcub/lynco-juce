@@ -64,27 +64,50 @@ struct AlignedSample
     may be negative, and so large that nativePosition * numerator does not fit in 64 bits; the
     result is exact as long as n does.
 
-    Stub: the patch that implements it is P007.1.
+    The arithmetic is done on exact integers without a wider type: the position is split into
+    whole multiples of the denominator and a remainder, so that no intermediate product reaches
+    2^63.
 */
-inline AlignedSample alignToApplicationSample ([[maybe_unused]] int64_t nativeTimeNs,
-                                               [[maybe_unused]] int64_t nativePosition,
-                                               [[maybe_unused]] int64_t numerator,
-                                               [[maybe_unused]] int64_t denominator,
-                                               [[maybe_unused]] int64_t applicationSampleRate) noexcept
+inline AlignedSample alignToApplicationSample (int64_t nativeTimeNs,
+                                               int64_t nativePosition,
+                                               int64_t numerator,
+                                               int64_t denominator,
+                                               int64_t applicationSampleRate) noexcept
 {
-    return {};
+    const auto floorDiv = [] (int64_t a, int64_t b)
+    {
+        const auto q = a / b;
+        return (a % b != 0 && (a < 0) != (b < 0)) ? q - 1 : q;
+    };
+
+    // position = whole * denominator + rest, with 0 <= rest < denominator
+    const auto whole = floorDiv (nativePosition, denominator);
+    const auto rest = nativePosition - whole * denominator;
+
+    // x = whole * numerator + rest * numerator / denominator, and n = whole * numerator + extra
+    const auto restScaled = rest * numerator;                                   // < 2^62
+    const auto extra = floorDiv (2 * restScaled + denominator, 2 * denominator); // x + 1/2, floored
+
+    // n - x, in units of 1 / denominator seconds-of-samples: |residual| <= denominator / 2
+    const auto residual = extra * denominator - restScaled;
+
+    // residual / denominator samples are residual * 1e9 / (denominator * rate) ns, nearest ns
+    const auto num = residual * 1'000'000'000;
+    const auto den = denominator * applicationSampleRate;
+
+    return { nativeTimeNs + floorDiv (2 * num + den, 2 * den), whole * numerator + extra };
 }
 
 /*  The same observation seen from a chunk of the callback's buffer that starts chunkStart samples
     in, as when a buffer is split into smaller callbacks: the time and flags are unchanged and the
     offset is chunkStart smaller. Chunks of chunks add up exactly.
 
-    Stub: the patch that implements it is P007.1.
 */
-inline AudioIODeviceTimestamp forChunkAt ([[maybe_unused]] const AudioIODeviceTimestamp& timestamp,
-                                          [[maybe_unused]] int64_t chunkStart) noexcept
+inline AudioIODeviceTimestamp forChunkAt (const AudioIODeviceTimestamp& timestamp, int64_t chunkStart) noexcept
 {
-    return {};
+    auto result = timestamp;
+    result.sampleOffset -= chunkStart;
+    return result;
 }
 
 //==============================================================================

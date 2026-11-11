@@ -506,6 +506,23 @@ inline std::optional<int64_t> identifyAsioClockOffset (const int64_t* driverTime
     return matches (candidates.qpcNs) ? std::optional<int64_t> (0) : std::nullopt;
 }
 
+/*  A timeGetTime clock (identifyAsioClockOffset found every time a whole millisecond) is a 32-bit
+    millisecond count x 1'000'000, so a driver's system time on it falls back to 0 after 2^32 ms
+    (49.7 days of uptime). Returns driverTimeNs plus the whole number of 2^32 ms periods that puts
+    it within half a period (2^31 ms) of referenceNs: the count continued exactly across any
+    number of wraps, with no estimate (SPEC "Rulings on the prosecution review", F5).
+
+    referenceNs is the previous switch's unwrapped time; for the first switch after an
+    identification, the timeGetTimeNs candidate it was identified against (the clock offset is
+    relative to that candidate's own value). Only for a timeGetTime clock: QPC and interrupt time
+    are 64-bit counts.
+*/
+inline int64_t unwrapTimeGetTimeNs (int64_t driverTimeNs, int64_t referenceNs) noexcept
+{
+    ignoreUnused (referenceNs);
+    return driverTimeNs;   // stub (rails, F5): no unwrap, as P021 does now; the builder implements the rule above
+}
+
 //==============================================================================
 /** One snd_pcm_htimestamp reading: availFrames were available when the hardware pointer was last
     updated, at tstamp (seconds and nanoseconds).

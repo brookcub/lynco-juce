@@ -806,6 +806,26 @@ public:
             expectOffset (identify (times (now.interruptTimeNs), now, maxAge), 118'186'640'000);
             expectOffset (identify (times (now.interruptTimeNs + 1), now, maxAge), std::nullopt);
         }
+
+        // F5 (SPEC "Rulings on the prosecution review"): 2^32 ms = 4'294'967'296'000'000 ns.
+        // Expected values from the rails author's Python oracle (2026-11-11).
+        beginTest ("A timeGetTime clock continues exactly across its 2^32 ms wrap, however many wraps");
+        {
+            // no wrap: unchanged
+            expectUnwrapped (1'005'000'000, 1'000'000'000, 1'005'000'000);
+
+            // W2: 4'294'967'290 ms, then the count wraps to 2 ms, 8 ms later
+            expectUnwrapped (2'000'000, 4'294'967'290'000'000, 4'294'967'298'000'000);
+
+            // the first switch after an identification at 4'294'967'295 ms, after the wrap
+            expectUnwrapped (1'000'000, 4'294'967'295'000'000, 4'294'967'297'000'000);
+
+            // a time from before the wrap, after the count has wrapped (a stale pair): not moved on
+            expectUnwrapped (4'294'967'295'000'000, 4'294'967'298'000'000, 4'294'967'295'000'000);
+
+            // the second wrap (99.4 days)
+            expectUnwrapped (3'000'000, 8'589'934'590'000'000, 8'589'934'595'000'000);
+        }
     }
 
     // Eight driver times ending at newest, step apart, oldest first
@@ -823,6 +843,12 @@ public:
     }
 
 private:
+    void expectUnwrapped (int64_t driverTimeNs, int64_t referenceNs, int64_t expected)
+    {
+        const auto actual = unwrapTimeGetTimeNs (driverTimeNs, referenceNs);
+        expect (actual == expected, "got " + String (actual) + ", expected " + String (expected));
+    }
+
     void expectOffset (std::optional<int64_t> actual, std::optional<int64_t> expected)
     {
         const auto text = [] (std::optional<int64_t> v) { return v.has_value() ? String (*v) : String ("absent"); };

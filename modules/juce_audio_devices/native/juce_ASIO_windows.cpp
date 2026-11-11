@@ -564,6 +564,7 @@ public:
 
             JUCE_ASIO_LOG ("starting");
             calledback = false;
+            clockOffsetNs.reset();
             err = asioObject->start();
 
             if (err != 0)
@@ -580,6 +581,10 @@ public:
                 int count = 300;
                 while (--count > 0 && ! calledback)
                     Thread::sleep (10);
+
+                // Once for this run, while the driver's callbacks are still being ignored
+                if (calledback)
+                    clockOffsetNs = measureClockOffset();
 
                 isStarted = true;
 
@@ -777,6 +782,10 @@ private:
     bool insideControlPanelModalLoop = false;
     bool shouldUsePreferredSize = false;
     int xruns = 0;
+
+    // From the driver's clock to the Time::getHighResolutionTicks() timeline in ns: set once for
+    // each run by measureClockOffset(), before the first callback is delivered, and never changed
+    std::optional<int64_t> clockOffsetNs;
 
     //==============================================================================
     static String convertASIOString (char* text, int length)
@@ -1298,6 +1307,96 @@ private:
     }
 
     //==============================================================================
+    static int64_t getHighResolutionNs() noexcept
+    {
+        const auto ticks = Time::getHighResolutionTicks();
+        const auto perSecond = Time::getHighResolutionTicksPerSecond();
+
+        return (ticks / perSecond) * 1'000'000'000 + (ticks % perSecond) * 1'000'000'000 / perSecond;
+    }
+
+    /*  The driver's time for the current block: the systemTime that ASIOGetSamplePosition reports
+        from inside the buffer switch, at offset 0, on the timeline of Time::getHighResolutionTicks().
+        JUCE does not ask for ASIOTime, so this is how a driver is asked for the time. A driver that
+        reports an error has no valid time for this block.
+    */
+    std::optional<AudioIODeviceTimestamp> getProcessingCycle() const
+    {
+        ASIOSamples position {};
+        ASIOTimeStamp systemTime {};
+        const auto err = asioObject->getSamplePosition (&position, &systemTime);
+
+        return CallbackTimeHelpers::getAsioProcessingCycle (err == ASE_OK, (uint32_t) systemTime.hi, (uint32_t) systemTime.lo, clockOffsetNs);
+    }
+
+    /*  Works out, once for each run of the device, how the driver's systemTime relates to the
+        Time::getHighResolutionTicks() timeline: the offset to add to it, or nothing if that can't
+        be established. The offset is a constant of the run; no callback adjusts it.
+
+        The ASIO SDK defines systemTime on Windows as timeGetTime() * 1e6, but drivers differ, and
+        some report the QPC clock instead. They are told apart by their values: a timeGetTime clock
+        only ever reports whole milliseconds, which a clock in 100 ns units does about once in ten
+        thousand readings, so eight readings that are all whole milliseconds are a timeGetTime clock.
+
+        A QPC clock is the same clock as the timeline, so its offset is zero. For a timeGetTime
+        clock the offset is the difference between the two clocks at one instant, taken as exactly
+        as the tick allows: the QPC time at the moment timeGetTime's value changes.
+
+        If the clock can't be identified (too few readings, or no tick change to catch), the
+        processing cycle is absent for the whole run. Once it is identified, no reading is compared
+        with the callback's arrival, and none is dropped or adjusted.
+    */
+    std::optional<int64_t> measureClockOffset()
+    {
+        constexpr int numReadingsNeeded = 8;
+        struct Reading { int64_t systemTimeNs; };
+        Reading readings[numReadingsNeeded] {};
+        int numReadings = 0;
+        const auto giveUpAt = Time::getMillisecondCounter() + 2000;
+
+        // Each reading is a new buffer switch, so these take eight buffers
+        while (numReadings < numReadingsNeeded && Time::getMillisecondCounter() < giveUpAt)
+        {
+            ASIOSamples position {};
+            ASIOTimeStamp systemTime {};
+            const auto err = asioObject->getSamplePosition (&position, &systemTime);
+            const auto systemTimeNs = (int64_t) (((uint64_t) (uint32_t) systemTime.hi << 32) | (uint32_t) systemTime.lo);
+
+            if (err == ASE_OK && (numReadings == 0 || systemTimeNs != readings[numReadings - 1].systemTimeNs))
+                readings[numReadings++] = { systemTimeNs };
+
+            Thread::sleep (1);
+        }
+
+        if (numReadings < numReadingsNeeded)
+            return {};
+
+        int64_t offset = 0;
+
+        if (std::all_of (std::begin (readings), std::end (readings),
+                         [] (const Reading& r) { return r.systemTimeNs % 1'000'000 == 0; }))
+        {
+            const auto firstTick = timeGetTime();
+            DWORD tick = firstTick;
+            int64_t atTickNs = 0;
+
+            // Spin to the instant the tick changes (as long as it takes, which is under a timer period)
+            for (auto limit = Time::getMillisecondCounter() + 100; tick == firstTick && Time::getMillisecondCounter() < limit;)
+            {
+                atTickNs = getHighResolutionNs();
+                tick = timeGetTime();
+            }
+
+            if (tick == firstTick)
+                return {};
+
+            offset = atTickNs - (int64_t) tick * 1'000'000;
+        }
+
+        return offset;
+    }
+
+    //==============================================================================
     void JUCE_ASIOCALLBACK callback (long index)
     {
         if (isStarted)
@@ -1330,12 +1429,16 @@ private:
                     inputFormat[i].convertToFloat (infos[i].buffers[bufferIndex], inBuffers[i], samps);
                 }
 
+                // hostTimeNs stays empty, as in stock JUCE; the processing cycle is the driver's own time of this block
+                const auto cycle = getProcessingCycle();
+                const AudioIODeviceCallbackContext context { nullptr, nullptr, nullptr, cycle.has_value() ? &*cycle : nullptr };
+
                 currentCallback->audioDeviceIOCallbackWithContext (inBuffers.getData(),
                                                                    numActiveInputChans,
                                                                    outBuffers,
                                                                    numActiveOutputChans,
                                                                    samps,
-                                                                   {});
+                                                                   context);
 
                 for (int i = 0; i < numActiveOutputChans; ++i)
                 {

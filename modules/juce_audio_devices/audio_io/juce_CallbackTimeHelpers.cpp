@@ -264,15 +264,19 @@ public:
     The time is systemTime + clockOffsetNs; no per-callback adjustment of any kind.
 
     nullopt if systemTimeValid (kSystemTimeValid) is false or there is no clock offset.
-
-    Stub: the patch that implements it is P021.
 */
-inline std::optional<AudioIODeviceTimestamp> getAsioProcessingCycle ([[maybe_unused]] bool systemTimeValid,
-                                                                     [[maybe_unused]] uint32_t systemTimeHi,
-                                                                     [[maybe_unused]] uint32_t systemTimeLo,
-                                                                     [[maybe_unused]] std::optional<int64_t> clockOffsetNs) noexcept
+inline std::optional<AudioIODeviceTimestamp> getAsioProcessingCycle (bool systemTimeValid,
+                                                                     uint32_t systemTimeHi,
+                                                                     uint32_t systemTimeLo,
+                                                                     std::optional<int64_t> clockOffsetNs) noexcept
 {
-    return {};
+    if (! systemTimeValid || ! clockOffsetNs.has_value())
+        return {};
+
+    // The halves are unsigned: the low one must not be sign-extended on its way into the sum
+    const auto systemTimeNs = (int64_t) (((uint64_t) systemTimeHi << 32) | (uint64_t) systemTimeLo);
+
+    return AudioIODeviceTimestamp { systemTimeNs + *clockOffsetNs, 0, 0 };
 }
 
 //==============================================================================

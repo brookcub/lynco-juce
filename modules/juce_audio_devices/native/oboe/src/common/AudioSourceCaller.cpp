@@ -31,7 +31,10 @@ int32_t AudioSourceCaller::onProcessFixedBlock(uint8_t *buffer, int32_t numBytes
                 : -1;
     } else {
         auto readResult = mStream->read(buffer, numFrames, mTimeoutNanos);
-        if (!readResult) return (int32_t) readResult.error();
+        if (!readResult) {
+            mReadError = readResult.error();
+            return (int32_t) mReadError;
+        }
         result = readResult.value() * mStream->getBytesPerFrame();
     }
     return result;

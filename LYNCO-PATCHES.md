@@ -418,3 +418,32 @@ An app that defines a macro does so at its own build boundary (for example `targ
   is reproduced by `--require-read-errors`: the conversion graph can swallow a
   native ErrorDisconnected read as a successful empty read. It is not repaired
   by this timing change.
+
+### P019: Surface native read errors through the Oboe conversion graph
+
+- **Files:** bundled Oboe `AudioSourceCaller.{h,cpp}` and
+  `DataConversionFlowGraph.cpp`.
+- **Why:** an input stream that needs rate or format conversion is wrapped in
+  `FilterAudioStream`. A blocking native read that failed (for example
+  `ErrorDisconnected`) became a negative byte count inside the flowgraph, the
+  sink treated it as an empty pull, and the caller saw a successful zero-frame
+  read. A client that detects disconnection only from a failed read (P016) then
+  receives silence forever without an error. Upstream Oboe has the same code.
+- **Contract:** `AudioSourceCaller` records the Result of a failed native read.
+  `DataConversionFlowGraph::read` clears it on entry and, when the pull delivered
+  no frames and a read failed, returns that Result as the negative value that
+  `FilterAudioStream::read` already maps to an error. Frames delivered earlier in
+  the same call are returned as a normal partial read; the failure is not
+  latched, so it is reported by the next read, which hits the same native
+  stream. This matches `AudioStream::read`, which returns a frame count for a
+  partial transfer and an error otherwise. No retry, timeout or lifecycle change;
+  the callback and output paths are unchanged.
+- **Verification:** `extras/OboeTimingTests`, Android arm64 Release, NDK
+  28.1.13356709, Pixel 7. On the P018 base, `--require-read-errors` fails
+  (`read_error_contract=FAIL`, converted result 0 for native -899). With this
+  patch it passes (converted result -899) and the normal run still passes
+  108/108 checks.
+- **Limits:** verified with deterministic child streams, not a physical device
+  disconnect. A block-aligned read that fails after part of an application block
+  was copied discards that partial block (it was never counted as delivered).
+  Application-level recovery is a separate concern.

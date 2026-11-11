@@ -237,8 +237,15 @@ Result DataConversionFlowGraph::configure(AudioStream *sourceStream, AudioStream
 int32_t DataConversionFlowGraph::read(void *buffer, int32_t numFrames, int64_t timeoutNanos) {
     if (mSourceCaller) {
         mSourceCaller->setTimeoutNanos(timeoutNanos);
+        mSourceCaller->clearReadError();
     }
     int32_t numRead = mSink->read(buffer, numFrames);
+    // The graph reports a failed native read as an empty pull. Frames already delivered by
+    // this call are returned, as AudioStream::read() does for a partial transfer; a
+    // persistent failure repeats on the next read. With none delivered, return the error.
+    if (numRead <= 0 && mSourceCaller && mSourceCaller->getReadError() != Result::OK) {
+        return (int32_t) mSourceCaller->getReadError();
+    }
     return numRead;
 }
 

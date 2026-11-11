@@ -281,4 +281,132 @@ private:
 
 static OboeStreamTimestampTests oboeStreamTimestampTests;
 
+//==============================================================================
+/*  Acceptance tests for P014.1 (CoreAudio) and the stamp conversion that P020 (iOS) shares. The
+    fake stamp has CoreAudio's field names and flag values of its own; its host time is in ticks of
+    24 per 1000 ns (a 125/3 timebase), so 240,000,000 ticks are 10 s. Expected values are worked by
+    hand. The hostTimeNs expectations are upstream JUCE 8.0.12's processBufferChunk.
+*/
+class CoreAudioChunkTimestampTests final : public UnitTest
+{
+public:
+    CoreAudioChunkTimestampTests() : UnitTest ("CoreAudio chunk timestamps", UnitTestCategories::audio) {}
+
+    void runTest() override
+    {
+        const FakeStamp input { hostTimeValid, 240'000'000 }, output { hostTimeValid | sampleTimeValid, 240'240'000 };
+
+        beginTest ("A buffer stamp with a valid host time gives that time at offset 0, zero included");
+        {
+            expectTimestamp (getBufferStartTimestamp (&input, hostTimeValid, toNanos), { 10'000'000'000, 0, 0 });
+
+            const FakeStamp zero { hostTimeValid, 0 };
+            expectTimestamp (getBufferStartTimestamp (&zero, hostTimeValid, toNanos), { 0, 0, 0 });
+        }
+
+        beginTest ("A stamp without a valid host time, or no stamp, gives nothing");
+        {
+            const FakeStamp sampleTimeOnly { sampleTimeValid, 240'000'000 };
+            expectTimestamp (getBufferStartTimestamp (&output, hostTimeValid, toNanos), { 10'010'000'000, 0, 0 });
+            expectAbsent (getBufferStartTimestamp (&sampleTimeOnly, hostTimeValid, toNanos));
+            expectAbsent (getBufferStartTimestamp ((const FakeStamp*) nullptr, hostTimeValid, toNanos));
+        }
+
+        beginTest ("Each chunk keeps the stamps' times, and the chunk at k has offset -k");
+        {
+            const auto first = chunk (&input, &output, 2, 2, 0);
+            expectTimestamp (first.inputStream,  { 10'000'000'000, 0, 0 });
+            expectTimestamp (first.outputStream, { 10'010'000'000, 0, 0 });
+
+            const auto third = chunk (&input, &output, 2, 2, 1024);
+            expectTimestamp (third.inputStream,  { 10'000'000'000, -1024, 0 });
+            expectTimestamp (third.outputStream, { 10'010'000'000, -1024, 0 });
+        }
+
+        beginTest ("A direction has an observation only with channels and a valid stamp");
+        {
+            const FakeStamp invalid { sampleTimeValid, 240'000'000 };
+
+            const auto outputOnly = chunk (&input, &output, 0, 2, 512);
+            expectAbsent (outputOnly.inputStream);
+            expectTimestamp (outputOnly.outputStream, { 10'010'000'000, -512, 0 });
+
+            const auto inputOnly = chunk (&input, &output, 2, 0, 512);
+            expectTimestamp (inputOnly.inputStream, { 10'000'000'000, -512, 0 });
+            expectAbsent (inputOnly.outputStream);
+
+            const auto invalidInput = chunk (&invalid, &output, 2, 2, 0);
+            expectAbsent (invalidInput.inputStream);
+            expectTimestamp (invalidInput.outputStream, { 10'010'000'000, 0, 0 });
+        }
+
+        beginTest ("hostTimeNs is upstream's: the first chunk only, the output stamp when there are outputs, flags unchecked");
+        {
+            expectHost (chunk (&input, &output, 2, 2, 0).hostTimeNs,   10'010'000'000);
+            expectHost (chunk (&input, &output, 2, 0, 0).hostTimeNs,   10'000'000'000);
+            expectHost (chunk (&input, &output, 0, 0, 0).hostTimeNs,   10'000'000'000);
+            expectNoHost (chunk (&input, &output, 2, 2, 512).hostTimeNs);
+
+            // Upstream converts a stamp's host time whatever its flags say, and with outputs it never
+            // falls back to the input stamp
+            const FakeStamp invalid { sampleTimeValid, 240'000'000 };
+            expectHost (chunk (&input, &invalid, 2, 2, 0).hostTimeNs, 10'000'000'000);
+            expectNoHost (chunk (&input, nullptr, 2, 2, 0).hostTimeNs);
+        }
+
+        beginTest ("A combined device's callback keeps the input device's hostTimeNs and input observation, and nothing else");
+        {
+            const uint64_t host = 7'000;
+            const AudioIODeviceTimestamp in { 5'000, -3, 0 }, out { 9'000, 0, 0 }, cycle { 8'000, 0, 0 };
+            const auto combined = getCombinedCallbackContext ({ &host, &in, &out, &cycle });
+            expect (combined.hostTimeNs == &host);
+            expect (combined.inputStream == &in);
+            expect (combined.outputStream == nullptr);
+            expect (combined.processingCycle == nullptr);
+
+            const auto noInput = getCombinedCallbackContext ({ &host, nullptr, &out, nullptr });
+            expect (noInput.hostTimeNs == &host);
+            expect (noInput.inputStream == nullptr && noInput.outputStream == nullptr);
+        }
+    }
+
+private:
+    struct FakeStamp
+    {
+        uint32_t mFlags;
+        uint64_t mHostTime;
+    };
+
+    static constexpr uint32_t sampleTimeValid = 1, hostTimeValid = 2;
+
+    static uint64_t toNanos (uint64_t ticks)    { return ticks * 125 / 3; }
+
+    static CoreAudioChunkTimes chunk (const FakeStamp* in, const FakeStamp* out, int numIns, int numOuts, int64_t start)
+    {
+        return getCoreAudioChunkTimes (in, out, numIns, numOuts, start, hostTimeValid, toNanos);
+    }
+
+    void expectTimestamp (const std::optional<AudioIODeviceTimestamp>& actual, const AudioIODeviceTimestamp& expected)
+    {
+        expect (actual.has_value() && isSameTimestamp (*actual, expected), "got " + describe (actual) + ", expected " + describe (expected));
+    }
+
+    void expectAbsent (const std::optional<AudioIODeviceTimestamp>& actual)
+    {
+        expect (! actual.has_value(), "got " + describe (actual) + ", expected absent");
+    }
+
+    void expectHost (std::optional<uint64_t> actual, uint64_t expected)
+    {
+        expect (actual == expected, "got " + (actual.has_value() ? String (*actual) : String ("none")) + ", expected " + String (expected));
+    }
+
+    void expectNoHost (std::optional<uint64_t> actual)
+    {
+        expect (! actual.has_value(), "got " + String (actual.value_or (0)) + ", expected none");
+    }
+};
+
+static CoreAudioChunkTimestampTests coreAudioChunkTimestampTests;
+
 } // namespace juce::CallbackTimeHelpers

@@ -127,4 +127,62 @@ inline std::optional<AudioIODeviceTimestamp> getOboeOutputTimestamp ([[maybe_unu
     return {};
 }
 
+//==============================================================================
+/*  The observation of an Apple AudioTimeStamp that belongs to the first frame of a buffer, as
+    CoreAudio's IOProc stamps and the iOS render callback's stamp do: the host time converted with
+    hostTimeToNanos, at offset 0. The stamp is anything with mFlags and mHostTime.
+
+    nullopt if there is no stamp or its flags do not include hostTimeValidFlag.
+
+    Stub: the patch that implements it is P014.1; P020 uses it for the iOS render cycle.
+*/
+template <typename Stamp, typename Flags, typename HostTimeToNanos>
+std::optional<AudioIODeviceTimestamp> getBufferStartTimestamp ([[maybe_unused]] const Stamp* stamp,
+                                                               [[maybe_unused]] Flags hostTimeValidFlag,
+                                                               [[maybe_unused]] HostTimeToNanos&& hostTimeToNanos)
+{
+    return {};
+}
+
+/** What one chunk of a CoreAudio IOProc buffer passes to its callback. */
+struct CoreAudioChunkTimes
+{
+    std::optional<uint64_t> hostTimeNs;
+    std::optional<AudioIODeviceTimestamp> inputStream, outputStream;
+};
+
+/*  The times of the chunk that starts chunkStart samples into the IOProc's buffers. The input and
+    output observations are the IOProc's inInputTime and inOutputTime stamps (getBufferStartTimestamp)
+    seen from the chunk (forChunkAt), each only when the callback has channels in that direction.
+
+    hostTimeNs is upstream JUCE 8.0.12's: on the first chunk only, the host time of the output stamp
+    when the callback has outputs and of the input stamp otherwise, converted without checking the
+    stamp's flags; nullopt on later chunks or without that stamp.
+
+    Stub: the patch that implements it is P014.1.
+*/
+template <typename Stamp, typename Flags, typename HostTimeToNanos>
+CoreAudioChunkTimes getCoreAudioChunkTimes ([[maybe_unused]] const Stamp* inputStamp,
+                                            [[maybe_unused]] const Stamp* outputStamp,
+                                            [[maybe_unused]] int numInputChannels,
+                                            [[maybe_unused]] int numOutputChannels,
+                                            [[maybe_unused]] int64_t chunkStart,
+                                            [[maybe_unused]] Flags hostTimeValidFlag,
+                                            [[maybe_unused]] HostTimeToNanos&& hostTimeToNanos)
+{
+    return {};
+}
+
+/*  The context that AudioIODeviceCombiner passes its callback from its input device's callback. It
+    keeps the input device's hostTimeNs, as upstream does, and its input observation. The callback's
+    outputs are presented later on another device, through a FIFO whose correspondence to the
+    output device's stamps is not established, so there is no output or cycle observation.
+
+    Stub: the patch that implements it is P014.1.
+*/
+inline AudioIODeviceCallbackContext getCombinedCallbackContext ([[maybe_unused]] const AudioIODeviceCallbackContext& inputDeviceContext) noexcept
+{
+    return {};
+}
+
 } // namespace juce::CallbackTimeHelpers

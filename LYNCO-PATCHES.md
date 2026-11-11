@@ -22,6 +22,10 @@ This file describes the JUCE problem each patch addresses and what it changes. I
 3. Rebuild and retest every LynCo app against the branch.
 4. Tag the result `lynco-<juce>.<n>`. Tags are never moved; a fix gets a new tag.
 
+### Revising a patch
+
+A patch number names the patch's purpose. When a published patch's purpose stays but its implementation is replaced, the replacement takes the next revision number: P009 becomes P009.1, then P009.2. It takes the original's place in the series, with trailer `LynCo-Patch: P009.1`; the earlier revision stays only in the tags that shipped it. The ledger keeps one section per purpose, describing the current revision, followed by one history line per earlier revision: `P009 (lynco-8.0.12.2 to .5): <what it did>. Replaced by P009.1 in .6: <why>.` A patch whose purpose is dropped is marked retired, with no successor. Numbers are never reused. A patch that has not been published is revised in its PR and keeps its number.
+
 ### Moving an app's pin
 
 An app pins the fork as a submodule gitlink at a tagged commit.

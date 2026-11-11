@@ -524,8 +524,8 @@ inline int64_t unwrapTimeGetTimeNs (int64_t driverTimeNs, int64_t referenceNs) n
 }
 
 //==============================================================================
-/** One snd_pcm_htimestamp reading: availFrames were available when the hardware pointer was last
-    updated, at tstamp (seconds and nanoseconds).
+/** One snd_pcm_status reading: availFrames were available when the hardware pointer was last
+    updated, at that update's tstamp (seconds and nanoseconds).
 */
 struct AlsaPositionReading
 {
@@ -534,7 +534,7 @@ struct AlsaPositionReading
     int64_t nanoseconds = 0;
 };
 
-/*  The observation of an ALSA PCM from one coherent snd_pcm_htimestamp reading: the frame at the
+/*  The observation of an ALSA PCM from one coherent snd_pcm_status reading: the frame at the
     hardware pointer, at the reading's time converted exactly to ns.
 
     applicationFramesAtReading is the application's own count of frames transferred (read for

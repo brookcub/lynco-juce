@@ -45,10 +45,13 @@ class AudioIODevice;
     timeNs is in nanoseconds on the clock and origin of Time::getHighResolutionTicks()
     (QueryPerformanceCounter on Windows, mach_absolute_time on Apple, CLOCK_MONOTONIC on
     Android and Linux), converted from the native value by an exact unit conversion (for
-    ASIO, plus a clock-origin offset measured once when the device starts; for JACK on a
-    CLOCK_MONOTONIC_RAW server, plus CLOCK_MONOTONIC - CLOCK_MONOTONIC_RAW as read in the
-    same callback). It is what the OS or driver reported, with no latency, smoothing or rate
-    correction. Zero is a valid time.
+    ASIO, plus a clock-origin offset measured once when the device starts and again after
+    the driver reports a clock-source change, with a 32-bit millisecond clock's wrap
+    unwrapped exactly; for JACK on a CLOCK_MONOTONIC_RAW server, plus CLOCK_MONOTONIC -
+    CLOCK_MONOTONIC_RAW as read in the same callback). WASAPI reports QPC times in 100 ns
+    units, which Windows rounds from the QPC count when the QPC frequency is not 10 MHz:
+    up to 100 ns of rounding that is the OS's, not the conversion's. It is what the OS or
+    driver reported, with no latency, smoothing or rate correction. Zero is a valid time.
 
     sampleOffset is the timestamped sample's position minus the position of the first
     sample of the callback's buffer, in sample frames (not interleaved values): negative
@@ -100,10 +103,16 @@ struct AudioIODeviceTimestamp
     |                        | the packet holding the callback's first real      | reported time (observation)                        |                           |
     |                        | sample (observation)                              |                                                    |                           |
     | Oboe (AAudio, API 30+) | getTimestamp: a frame entering the pipeline       | getTimestamp: a frame leaving the pipeline         | -                         |
-    | ASIO                   | -                                                 | -                                                  | the current block's       |
-    |                        |                                                   |                                                    | systemTime, at offset 0   |
-    | ALSA                   | snd_pcm_htimestamp: the hardware pointer's        | snd_pcm_htimestamp: the hardware pointer's         | -                         |
-    |                        | position at its last update (ring/DMA reference)  | position at its last update (ring/DMA reference)   |                           |
+    | ASIO                   | -                                                 | -                                                  | the buffer switch's       |
+    |                        |                                                   |                                                    | (samplePosition,          |
+    |                        |                                                   |                                                    | systemTime) pair, at that |
+    |                        |                                                   |                                                    | position's offset from    |
+    |                        |                                                   |                                                    | the block's start: 0 for  |
+    |                        |                                                   |                                                    | its own pair, -blockSize  |
+    |                        |                                                   |                                                    | for the previous one's    |
+    | ALSA                   | snd_pcm_status: the hardware pointer's position   | snd_pcm_status: the hardware pointer's position at | -                         |
+    |                        | at its last update, with that update's tstamp     | its last update, with that update's tstamp         |                           |
+    |                        | (ring/DMA reference)                              | (ring/DMA reference)                               |                           |
     | JACK                   | -                                                 | -                                                  | jack_get_cycle_times: the |
     |                        |                                                   |                                                    | current cycle's start, at |
     |                        |                                                   |                                                    | offset 0 (prediction)     |

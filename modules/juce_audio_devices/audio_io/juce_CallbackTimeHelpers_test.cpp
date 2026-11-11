@@ -1004,6 +1004,12 @@ public:
             // a nonzero jack_get_cycle_times result, with readings that are otherwise present
             expectAbsent (cycle (-1, 29'995'000, 30'062'600'250, 30'000'000, 30'000'000'500));
             expectAbsent (cycle (1, 6'994'667, 7'000'000'250, 7'000'000, 6'940'000'400));
+
+            // F4 (SPEC "Rulings on the prosecution review"): a libjack without jack_get_cycle_times
+            // is passed as a failed result, and the times it leaves at zero are never a time 0.
+            // W3's readings (review-witnesses/repro.cpp): a MONOTONIC server, then a RAW server.
+            expectAbsent (cycle (-1, 0, 7'000'000'000'123, 7'000'000'000, 6'999'700'000'000));
+            expectAbsent (cycle (-1, 0, 7'000'000'000'123, 6'999'700'000, 6'999'700'000'000));
         }
 
         beginTest ("The conversion: microseconds x 1000, plus the readings' MONOTONIC - RAW difference with its sign");

@@ -454,14 +454,15 @@ inline std::optional<AudioIODeviceTimestamp> getAlsaTimestamp (bool isCapture,
 
     nullopt if jack_get_cycle_times failed (a nonzero result) or the clock is not known to be
     CLOCK_MONOTONIC.
-
-    Stub: the patch that implements it is P023.
 */
-inline std::optional<AudioIODeviceTimestamp> getJackProcessingCycle ([[maybe_unused]] int getCycleTimesResult,
-                                                                     [[maybe_unused]] uint64_t currentUsecs,
-                                                                     [[maybe_unused]] bool clockIsMonotonic) noexcept
+inline std::optional<AudioIODeviceTimestamp> getJackProcessingCycle (int getCycleTimesResult,
+                                                                     uint64_t currentUsecs,
+                                                                     bool clockIsMonotonic) noexcept
 {
-    return {};
+    if (getCycleTimesResult != 0 || ! clockIsMonotonic)
+        return {};
+
+    return AudioIODeviceTimestamp { (int64_t) currentUsecs * 1000, 0, 0 };
 }
 
 } // namespace juce::CallbackTimeHelpers

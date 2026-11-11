@@ -306,7 +306,6 @@ public:
         juce::jack_on_shutdown (client, shutdownCallback, this);
         juce::jack_on_info_shutdown (client, infoShutdownCallback, this);
         juce::jack_set_xrun_callback (client, xrunCallback, this);
-        cycleTimesAreMonotonic = jackClockIsMonotonic();
         juce::jack_activate (client);
         deviceIsOpen = true;
 
@@ -480,14 +479,15 @@ private:
         {
             if ((numActiveInChans + numActiveOutChans) > 0)
             {
-                // The current cycle's start, as JACK reports it; absent if the call fails or this
-                // server's clock was not shown to be CLOCK_MONOTONIC at activation.
+                // The current cycle's start, as JACK predicts it, moved onto CLOCK_MONOTONIC from
+                // whichever of that and CLOCK_MONOTONIC_RAW the server's clock is, judged anew
+                // from readings taken here; absent if the call fails or the clock is neither.
                 jack_nframes_t cycleFrames = 0;
                 jack_time_t cycleUsecs = 0, nextUsecs = 0;
                 float periodUsecs = 0;
 
                 const auto cycleResult = juce::jack_get_cycle_times (client, &cycleFrames, &cycleUsecs, &nextUsecs, &periodUsecs);
-                const auto cycle = CallbackTimeHelpers::getJackProcessingCycle (cycleResult, cycleUsecs, cycleTimesAreMonotonic);
+                const auto cycle = CallbackTimeHelpers::getJackProcessingCycle (cycleResult, cycleUsecs, readClocks());
 
                 AudioIODeviceCallbackContext context;
                 context.processingCycle = cycle.has_value() ? &*cycle : nullptr;
@@ -505,6 +505,29 @@ private:
             for (int i = 0; i < numActiveOutChans; ++i)
                 zeromem (outChans[i], static_cast<size_t> (numSamples) * sizeof (float));
         }
+    }
+
+    /*  CLOCK_MONOTONIC, jack_get_time() and CLOCK_MONOTONIC_RAW, back to back in this order.
+        Anywhere but Linux and BSD the readings are far apart, so the cycle time stays absent.
+    */
+    static CallbackTimeHelpers::JackClockReadings readClocks() noexcept
+    {
+        CallbackTimeHelpers::JackClockReadings readings { -1'000'000'000'000, 0, -1'000'000'000'000 };
+
+       #if JUCE_LINUX || JUCE_BSD
+        const auto nanosecondsNow = [] (clockid_t clock)
+        {
+            timespec t;
+            clock_gettime (clock, &t);
+            return (int64_t) t.tv_sec * 1'000'000'000 + (int64_t) t.tv_nsec;
+        };
+
+        readings.monotonicNs    = nanosecondsNow (CLOCK_MONOTONIC);
+        readings.jackTimeUsecs  = juce::jack_get_time();
+        readings.monotonicRawNs = nanosecondsNow (CLOCK_MONOTONIC_RAW);
+       #endif
+
+        return readings;
     }
 
     static int processCallback (jack_nframes_t nframes, void* callbackArgument)
@@ -589,35 +612,7 @@ private:
         JUCE_JACK_LOG ("JackAudioIODevice::errorCallback " + String (msg));
     }
 
-    /*  Whether jack_get_time() is on JUCE's clock: read it between two CLOCK_MONOTONIC readings and
-        accept it if it lies within a millisecond of them (microseconds then convert exactly, x 1000,
-        with no offset). jackd's clock source is chosen when the server starts, so this is checked
-        on the running server at every activation. Anywhere but Linux and BSD, JUCE's clock is
-        another one, and the cycle time stays absent.
-    */
-    static bool jackClockIsMonotonic()
-    {
-       #if JUCE_LINUX || JUCE_BSD
-        const auto nanosecondsNow = []
-        {
-            timespec t;
-            clock_gettime (CLOCK_MONOTONIC, &t);
-            return (int64_t) t.tv_sec * 1'000'000'000 + (int64_t) t.tv_nsec;
-        };
-
-        constexpr int64_t toleranceNs = 1'000'000;
-        const auto before = nanosecondsNow();
-        const auto jackNs = (int64_t) juce::jack_get_time() * 1000;
-        const auto after = nanosecondsNow();
-
-        return jackNs >= before - toleranceNs && jackNs <= after + toleranceNs;
-       #else
-        return false;
-       #endif
-    }
-
     bool deviceIsOpen = false;
-    bool cycleTimesAreMonotonic = false;
     jack_client_t* client = nullptr;
     String lastError;
     AudioIODeviceCallback* callback = nullptr;

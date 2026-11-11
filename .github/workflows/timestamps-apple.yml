@@ -64,4 +64,4 @@ jobs:
         run: |
           app=$(find build-check -name CombinedDeviceCheck -type f -perm -u+x | head -n 1)
           echo "Running $app"
-          "$app"
+          lldb --batch -o run -o bt -o "process kill" -- "$app" 2>&1 | tail -80

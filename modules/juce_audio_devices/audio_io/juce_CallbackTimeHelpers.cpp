@@ -240,4 +240,22 @@ inline std::optional<AudioIODeviceTimestamp> getAlsaTimestamp ([[maybe_unused]] 
     return {};
 }
 
+//==============================================================================
+/*  The processing-cycle observation of a JACK process callback, from jack_get_cycle_times: the
+    current cycle's start, currentUsecs, converted exactly to ns (x 1000), at offset 0.
+    clockIsMonotonic says that this JACK's clock is CLOCK_MONOTONIC in microseconds, which JUCE's
+    clock on Linux is too.
+
+    nullopt if jack_get_cycle_times failed (a nonzero result) or the clock is not known to be
+    CLOCK_MONOTONIC.
+
+    Stub: the patch that implements it is P023.
+*/
+inline std::optional<AudioIODeviceTimestamp> getJackProcessingCycle ([[maybe_unused]] int getCycleTimesResult,
+                                                                     [[maybe_unused]] uint64_t currentUsecs,
+                                                                     [[maybe_unused]] bool clockIsMonotonic) noexcept
+{
+    return {};
+}
+
 } // namespace juce::CallbackTimeHelpers

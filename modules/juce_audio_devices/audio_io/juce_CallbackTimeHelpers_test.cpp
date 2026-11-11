@@ -540,4 +540,46 @@ private:
 
 static AlsaTimestampTests alsaTimestampTests;
 
+//==============================================================================
+/*  Acceptance tests for P023 (JACK processing-cycle time). The cycle times are fakes; expected
+    times are microseconds x 1000, worked by hand.
+*/
+class JackProcessingCycleTests final : public UnitTest
+{
+public:
+    JackProcessingCycleTests() : UnitTest ("JACK processing cycle timestamps", UnitTestCategories::audio) {}
+
+    void runTest() override
+    {
+        beginTest ("The current cycle's start in ns, exactly, at offset 0, from zero to large values");
+        {
+            expectTimestamp (getJackProcessingCycle (0, 1'234'567, true), { 1'234'567'000, 0, 0 });
+            expectTimestamp (getJackProcessingCycle (0, 0, true), { 0, 0, 0 });
+
+            // 2^53 + 1 us (285 years) is still exact
+            expectTimestamp (getJackProcessingCycle (0, 9'007'199'254'740'993, true), { 9'007'199'254'740'993'000, 0, 0 });
+        }
+
+        beginTest ("A failed query, or a clock not known to be CLOCK_MONOTONIC, gives nothing");
+        {
+            expectTimestamp (getJackProcessingCycle (0, 1'000, true), { 1'000'000, 0, 0 });
+            expectAbsent (getJackProcessingCycle (-1, 1'000, true));
+            expectAbsent (getJackProcessingCycle (0, 1'000, false));
+        }
+    }
+
+private:
+    void expectTimestamp (const std::optional<AudioIODeviceTimestamp>& actual, const AudioIODeviceTimestamp& expected)
+    {
+        expect (actual.has_value() && isSameTimestamp (*actual, expected), "got " + describe (actual) + ", expected " + describe (expected));
+    }
+
+    void expectAbsent (const std::optional<AudioIODeviceTimestamp>& actual)
+    {
+        expect (! actual.has_value(), "got " + describe (actual) + ", expected absent");
+    }
+};
+
+static JackProcessingCycleTests jackProcessingCycleTests;
+
 } // namespace juce::CallbackTimeHelpers

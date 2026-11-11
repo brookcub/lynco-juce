@@ -564,7 +564,10 @@ public:
 
             JUCE_ASIO_LOG ("starting");
             calledback = false;
-            clockOffsetKnown = false;
+            clockGeneration = 0;
+            offsetGeneration = -1;
+            unwrapGeneration = -1;
+            clockSourceFlagWasSet = false;
             blockTimes.reset (currentBlockSizeSamples);
             beginCollectingSystemTimes();
             err = asioObject->start();
@@ -584,9 +587,13 @@ public:
                 while (--count > 0 && ! calledback)
                     Thread::sleep (10);
 
-                // Once for this run, while the driver's callbacks are still being ignored
+                // Once for this run, while the driver's callbacks are still being ignored; if that fails,
+                // or the driver changes its clock source, the background thread (re)identifies
                 if (calledback)
-                    identifyClockOffset();
+                {
+                    identifyClockOffset (clockGeneration.load());
+                    clockThread.startThread();
+                }
 
                 isStarted = true;
 
@@ -625,7 +632,7 @@ public:
     {
         error.clear();
         stopTimer();
-        clockSourceChange.cancelPendingUpdate();
+        clockThread.stopThread (10000);
         stop();
 
         if (asioObject != nullptr && deviceIsOpen)
@@ -787,11 +794,22 @@ private:
     int xruns = 0;
 
     // From the driver's clock to the Time::getHighResolutionTicks() timeline in ns: identified and
-    // measured once for each run by identifyClockOffset(), and again only if the driver reports a
-    // change of clock source, when the processing cycle is absent until that has finished. The
-    // callback thread only reads it.
-    std::atomic<bool> clockOffsetKnown { false };
+    // measured by identifyClockOffset() when the run opens, and again each time the driver reports
+    // a change of clock source (and after a failure, until it succeeds), when the processing cycle
+    // is absent until that has finished. The callback thread only reads it.
+    //
+    // clockGeneration counts the clock sources of the run; the callback thread bumps it on the
+    // transition of the driver's change flag, which is all it does to ask for a new identification.
+    // An identification publishes its values and then offsetGeneration, the generation it started
+    // under, so an offset is current only while offsetGeneration == clockGeneration: a newer
+    // transition makes a result in flight stale without anyone having to cancel it.
+    std::atomic<int> clockGeneration { 0 }, offsetGeneration { -1 };
     std::atomic<int64_t> clockOffsetValue { 0 };
+    std::atomic<bool> clockIsTimeGetTime { false };   // the identified clock is a 32-bit ms count, which wraps
+    std::atomic<int64_t> clockReferenceNs { 0 };      // for that clock, timeGetTime in ns when it was identified
+    bool clockSourceFlagWasSet = false;               // callback thread: the previous switch's kClockSourceChanged
+    int unwrapGeneration = -1;                        // callback thread: the identification unwrapReferenceNs follows
+    int64_t unwrapReferenceNs = 0;                    // callback thread: the previous switch's unwrapped system time
 
     // The driver's first eight system times of an identification, written by the callback thread
     // while collecting, read by identifyClockOffset() once the count has reached eight
@@ -803,20 +821,34 @@ private:
 
     CallbackTimeHelpers::AsioBlockTimes blockTimes;   // callback thread, under callbackLock
 
-    struct ClockSourceChange final : private AsyncUpdater
+    // Identifies the clock off every other thread: never the message thread, never the callback thread
+    struct ClockThread final : public Thread
     {
-        explicit ClockSourceChange (ASIOAudioIODevice& d) : device (d) {}
-        ~ClockSourceChange() override { cancelPendingUpdate(); }
+        explicit ClockThread (ASIOAudioIODevice& d) : Thread ("ASIO clock"), device (d) {}
 
-        using AsyncUpdater::triggerAsyncUpdate;
-        using AsyncUpdater::cancelPendingUpdate;
+        void run() override
+        {
+            while (! threadShouldExit())
+            {
+                const auto generation = device.clockGeneration.load();
 
-        void handleAsyncUpdate() override  { device.identifyClockOffset(); }
+                if (device.offsetGeneration.load() == generation)
+                {
+                    wait (10);
+                    continue;
+                }
+
+                device.identifyClockOffset (generation);
+
+                if (device.offsetGeneration.load() != device.clockGeneration.load())
+                    wait (250);
+            }
+        }
 
         ASIOAudioIODevice& device;
     };
 
-    ClockSourceChange clockSourceChange { *this };
+    ClockThread clockThread { *this };
 
     //==============================================================================
     static String convertASIOString (char* text, int length)
@@ -1443,15 +1475,18 @@ private:
         to QPC. Once it is identified, no reading is compared with the callback's arrival, and none
         is dropped or adjusted.
 
-        Not for the callback thread: it waits for eight buffer switches and for a timer tick.
+        generation is clockGeneration as read before the identification started; the result is
+        published under it, so it is ignored if the clock source changed meanwhile.
+
+        Not for the callback thread, nor the message thread: it waits for eight buffer switches and
+        for a timer tick. Called by open() and by clockThread.
     */
-    void identifyClockOffset()
+    void identifyClockOffset (int generation)
     {
-        clockOffsetKnown = false;
         beginCollectingSystemTimes();
 
         for (auto giveUpAt = Time::getMillisecondCounter() + 2000;
-             numSystemTimes < numTimesToIdentify && Time::getMillisecondCounter() < giveUpAt;)
+             numSystemTimes < numTimesToIdentify && Time::getMillisecondCounter() < giveUpAt && ! clockThread.threadShouldExit();)
             Thread::sleep (1);
 
         collectingSystemTimes = false;
@@ -1463,7 +1498,7 @@ private:
         // block ahead of its arrival, so the clocks are read at least a block (and a margin) later
         const auto blockNs = (int64_t) (currentBlockSizeSamples / currentSampleRate * 1e9);
 
-        while (getHighResolutionNs() < lastSystemTimeArrivedNs + blockNs + 1'000'000)
+        while (getHighResolutionNs() < lastSystemTimeArrivedNs + blockNs + 1'000'000 && ! clockThread.threadShouldExit())
             Thread::yield();
 
         const auto firstTick = timeGetTime();
@@ -1487,8 +1522,12 @@ private:
 
         if (const auto offset = CallbackTimeHelpers::identifyAsioClockOffset (systemTimes, numTimesToIdentify, candidates, maxAgeNs))
         {
+            // A timeGetTime clock is the one whose times are all whole milliseconds (as the helper decides)
+            clockIsTimeGetTime = std::all_of (systemTimes, systemTimes + numTimesToIdentify,
+                                              [] (int64_t t) { return t % 1'000'000 == 0; });
+            clockReferenceNs = candidates.timeGetTimeNs;
             clockOffsetValue = *offset;
-            clockOffsetKnown = true;
+            offsetGeneration.store (generation, std::memory_order_release);
         }
     }
 
@@ -1499,10 +1538,13 @@ private:
 
         if (switchTime.clockSourceChanged)
         {
-            // The offset belongs to the old clock: absent until the new one is identified, off this thread
-            clockOffsetKnown = false;
-            clockSourceChange.triggerAsyncUpdate();
+            // The offset belongs to the old clock: absent until the new one is identified, which the
+            // clock thread does. One request for each transition of the flag, however long it stays set.
+            if (! clockSourceFlagWasSet)
+                ++clockGeneration;
         }
+
+        clockSourceFlagWasSet = switchTime.clockSourceChanged;
 
         if (isStarted)
         {
@@ -1517,12 +1559,35 @@ private:
         calledback = true;
     }
 
-    void processBuffer (long bufferIndex, const CallbackTimeHelpers::AsioSwitchTime& switchTime)
+    void processBuffer (long bufferIndex, const CallbackTimeHelpers::AsioSwitchTime& rawSwitchTime)
     {
         const ScopedLock sl (callbackLock);
 
         // Every switch counts, so the block starts stay in step even when no callback is attached
-        const auto offset = clockOffsetKnown ? std::optional<int64_t> (clockOffsetValue.load()) : std::nullopt;
+        auto switchTime = rawSwitchTime;
+        std::optional<int64_t> offset;
+
+        if (const auto identified = offsetGeneration.load (std::memory_order_acquire); identified == clockGeneration.load())
+        {
+            offset = clockOffsetValue.load();
+
+            // A 32-bit ms clock wraps every 49.7 days: continue its count exactly (the offset is
+            // against the identification's unwrapped value)
+            if (clockIsTimeGetTime && switchTime.systemTimeValid)
+            {
+                if (unwrapGeneration != identified)
+                {
+                    unwrapGeneration = identified;
+                    unwrapReferenceNs = clockReferenceNs;
+                }
+
+                const auto driverNs = (int64_t) (((uint64_t) switchTime.systemTimeHi << 32) | (uint64_t) switchTime.systemTimeLo);
+                unwrapReferenceNs = CallbackTimeHelpers::unwrapTimeGetTimeNs (driverNs, unwrapReferenceNs);
+                switchTime.systemTimeHi = (uint32_t) ((uint64_t) unwrapReferenceNs >> 32);
+                switchTime.systemTimeLo = (uint32_t) unwrapReferenceNs;
+            }
+        }
+
         const auto cycle = blockTimes.next (switchTime, offset);
 
         if (bufferIndex >= 0)

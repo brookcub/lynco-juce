@@ -434,6 +434,8 @@ public:
     {
         size = blockSize;
         start.reset();
+        newest = 0;
+        lost = false;
     }
 
     std::optional<AudioIODeviceTimestamp> next (const AsioSwitchTime& switchTime, std::optional<int64_t> clockOffsetNs) noexcept
@@ -443,22 +445,44 @@ public:
         if (start.has_value())
             *start += size;
 
-        if (switchTime.samplePositionValid && (! start.has_value() || position > *start))
-            start = position;
+        int64_t sampleOffset = 0;
+
+        if (switchTime.samplePositionValid)
+        {
+            if (! start.has_value())
+            {
+                start = newest = position;
+            }
+            else if (newest <= position && position <= *start && (*start - position) % size == 0)
+            {
+                sampleOffset = position - *start;
+                newest = position;
+            }
+            else
+            {
+                start.reset();
+                lost = true;
+                return {};
+            }
+        }
 
         if (! switchTime.systemTimeValid || ! switchTime.samplePositionValid || ! clockOffsetNs.has_value())
             return {};
 
         // The halves are unsigned: the low one must not be sign-extended on its way into the sum
         const auto systemTimeNs = (int64_t) (((uint64_t) switchTime.systemTimeHi << 32) | (uint64_t) switchTime.systemTimeLo);
-        const uint32_t flags = (switchTime.sampleRateChanged || switchTime.clockSourceChanged) ? (uint32_t) AudioIODeviceTimestamp::nativeDiscontinuity : 0u;
+        const bool changed = switchTime.sampleRateChanged || switchTime.clockSourceChanged || lost;
+        lost = false;
 
-        return AudioIODeviceTimestamp { systemTimeNs + *clockOffsetNs, position - *start, flags };
+        return AudioIODeviceTimestamp { systemTimeNs + *clockOffsetNs, sampleOffset,
+                                        changed ? (uint32_t) AudioIODeviceTimestamp::nativeDiscontinuity : 0u };
     }
 
 private:
     int size = 0;
     std::optional<int64_t> start;   // the current block's first frame, in the driver's count
+    int64_t newest = 0;             // the newest position seen
+    bool lost = false;              // tracking was lost; the next delivered observation says so
 };
 
 /*  Three candidate clocks, read back to back at the instant timeGetTime()'s value changes, after
@@ -519,8 +543,12 @@ inline std::optional<int64_t> identifyAsioClockOffset (const int64_t* driverTime
 */
 inline int64_t unwrapTimeGetTimeNs (int64_t driverTimeNs, int64_t referenceNs) noexcept
 {
-    ignoreUnused (referenceNs);
-    return driverTimeNs;   // stub (rails, F5): no unwrap, as P021 does now; the builder implements the rule above
+    constexpr int64_t period = (int64_t) 1 << 32;                      // ms
+    constexpr int64_t periodNs = period * 1'000'000;
+    const auto diff = referenceNs - driverTimeNs;                      // floor((diff + half) / period) periods, exactly
+    const auto k = (diff + periodNs / 2) >= 0 ? (diff + periodNs / 2) / periodNs
+                                              : -((-(diff + periodNs / 2) + periodNs - 1) / periodNs);
+    return driverTimeNs + k * periodNs;
 }
 
 //==============================================================================

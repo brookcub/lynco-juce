@@ -90,7 +90,8 @@ struct AudioIODeviceTimestamp
     |------------------------|---------------------------------------------------|----------------------------------------------------|---------------------------|
     | CoreAudio, one device  | inInputTime: the buffer's first frame acquired    | inOutputTime: the buffer's first frame to be       | -                         |
     |                        | from the hardware (observation)                   | passed to the hardware (prediction)                |                           |
-    | CoreAudio, combined    | the input device's inInputTime                    | -                                                  | -                         |
+    | CoreAudio, combined    | the input device's inInputTime                    | the output device's inOutputTime, at the frame it  | -                         |
+    |                        |                                                   | read from the FIFO (prediction)                    |                           |
     | iOS                    | -                                                 | -                                                  | the render timestamp, at  |
     |                        |                                                   |                                                    | offset 0, with no capture |
     |                        |                                                   |                                                    | or presentation claim     |

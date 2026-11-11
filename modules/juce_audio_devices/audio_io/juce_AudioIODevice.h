@@ -38,7 +38,64 @@ namespace juce
 class AudioIODevice;
 
 /**
+    One native device timestamp: the time at which one sample of a stream passed the
+    reference point its source names, and where that sample is relative to the
+    callback's buffer.
+
+    timeNs is in nanoseconds on the clock and origin of Time::getHighResolutionTicks()
+    (QueryPerformanceCounter on Windows, mach_absolute_time on Apple, CLOCK_MONOTONIC on
+    Android and Linux), converted from the native value by an exact unit conversion (for
+    ASIO, plus a clock-origin offset measured once when the device starts and again after
+    the driver reports a clock-source change, with a 32-bit millisecond clock's wrap
+    unwrapped exactly; for JACK on a CLOCK_MONOTONIC_RAW server, plus CLOCK_MONOTONIC -
+    CLOCK_MONOTONIC_RAW as read in the same callback). WASAPI reports QPC times in 100 ns
+    units, which Windows rounds from the QPC count when the QPC frequency is not 10 MHz:
+    up to 100 ns of rounding that is the OS's, not the conversion's. It is what the OS or
+    driver reported, with no latency, smoothing or rate correction. Zero is a valid time.
+
+    sampleOffset is the timestamped sample's position minus the position of the first
+    sample of the callback's buffer, in sample frames (not interleaved values): negative
+    means before the buffer, zero its first sample, positive after its start. A real
+    sample after leading padding can have a positive offset; padding is never timestamped.
+
+    The one adjustment a backend may make is when sample-rate conversion puts the native
+    position x between two application samples: the position becomes the nearest sample,
+    n = floor (x + 1/2), and the time moves by (n - x) samples at the application sample
+    rate, which is never more than half a sample period. It is applied once.
+
+    @tags{Audio}
+*/
+struct AudioIODeviceTimestamp
+{
+    int64_t timeNs = 0;
+    int64_t sampleOffset = 0;
+
+    /** The native source's own qualifications of this reading, as a combination of the
+        flags below. A reading that the source marks invalid without a value is absent.
+    */
+    uint32_t nativeFlags = 0;
+
+    enum : uint32_t
+    {
+        nativeDiscontinuity   = 1u << 0, /**< The source marked a data discontinuity or reset. */
+        nativeTimestampError  = 1u << 1, /**< The source marked this time as erroneous. */
+        nativeReducedAccuracy = 1u << 2  /**< The source marked this reading as less accurate. */
+    };
+};
+
+/**
     Additional information that may be passed to the AudioIODeviceCallback.
+
+    Each role pointer is nullptr when there is no observation for this callback, and
+    otherwise points to one native observation for that role's stream. nullptr is the
+    only absence marker. Each backend's sources:
+
+    | Backend                | inputStream                                       | outputStream                                       | processingCycle           |
+    |------------------------|---------------------------------------------------|----------------------------------------------------|---------------------------|
+    | all others             | -                                                 | -                                                  | -                         |
+
+    An observation never crosses a stop: audioDeviceAboutToStart and audioDeviceStopped
+    delimit the run that a role's sample positions belong to.
 
     @tags{Audio}
 */
@@ -48,6 +105,21 @@ struct AudioIODeviceCallbackContext
         an integer holding the current value; otherwise, this will be nullptr.
     */
     const uint64_t* hostTimeNs = nullptr;
+
+    /** A time at the source's input capture or pipeline reference point, for a sample
+        of the input stream. Not necessarily when the signal left the ADC.
+    */
+    const AudioIODeviceTimestamp* inputStream = nullptr;
+
+    /** A time at the source's playback or presentation reference point, for a sample of
+        the output stream: an observed position or a native prediction, per source.
+    */
+    const AudioIODeviceTimestamp* outputStream = nullptr;
+
+    /** The native time of the processing cycle this callback belongs to, with no claim
+        about capture or presentation.
+    */
+    const AudioIODeviceTimestamp* processingCycle = nullptr;
 };
 
 //==============================================================================

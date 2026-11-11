@@ -178,14 +178,40 @@ public:
         int64_t childPosition = 0;
         Result result = mChildStream->getTimestamp(clockId, &childPosition, timeNanoseconds);
         if (result != Result::OK) return result;
+        // The converted position x is placed on the nearest application frame, n = floor (x + 1/2)
+        // (a half-frame residual rounds up), and the time moves by (n - x) / rate so that the
+        // frame and time still describe one point of the stream. This is the one alignment, and
+        // the same rule as CallbackTimeHelpers::alignToApplicationSample in juce_audio_devices,
+        // which bundled Oboe cannot include. With a whole-frame delay x is an exact fraction
+        // N / child, so the integer arithmetic below is exact; a fractional delay falls back to
+        // doubles.
+        const int64_t app = getSampleRate();
+        const int64_t child = mChildStream->getSampleRate();
         const double delay = mFlowGraph->getSourceDelayInFrames();
-        const double position = getDirection() == Direction::Output
-                ? childPosition * mRateScaler - delay
-                : (childPosition + delay) * mRateScaler;
-        const auto wholePosition = static_cast<int64_t>(std::floor(position));
-        // Preserve the same sample/time line when the converted position is fractional.
-        *timeNanoseconds += static_cast<int64_t>(std::llround(
-                (wholePosition - position) * kNanosPerSecond / getSampleRate()));
+        const auto wholeDelay = static_cast<int64_t>(std::floor(delay));
+        const double fractionalDelay = delay - static_cast<double>(wholeDelay);
+        const bool isOutput = getDirection() == Direction::Output;
+        const int64_t numerator = isOutput ? childPosition * app - wholeDelay * child
+                                           : (childPosition + wholeDelay) * app;
+        const double extra = isOutput ? -fractionalDelay
+                                      : fractionalDelay * static_cast<double>(app) / static_cast<double>(child);
+        const auto floorDiv = [](int64_t a, int64_t b) {
+            const int64_t q = a / b;
+            return (a % b != 0 && (a < 0) != (b < 0)) ? q - 1 : q;
+        };
+        int64_t wholePosition;
+        if (extra == 0.0) {
+            wholePosition = floorDiv(2 * numerator + child, 2 * child);
+            const int64_t residual = wholePosition * child - numerator; // (n - x) * child
+            const int64_t num = residual * kNanosPerSecond;
+            const int64_t den = child * app;
+            *timeNanoseconds += floorDiv(2 * num + den, 2 * den);
+        } else {
+            const double position = static_cast<double>(numerator) / static_cast<double>(child) + extra;
+            wholePosition = static_cast<int64_t>(std::floor(position + 0.5));
+            *timeNanoseconds += static_cast<int64_t>(std::llround(
+                    (static_cast<double>(wholePosition) - position) * kNanosPerSecond / app));
+        }
         if (framePosition) *framePosition = wholePosition;
         return result;
     }

@@ -75,7 +75,9 @@ namespace
 
 int main()
 {
+    std::cout << "start" << std::endl;
     ScopedJuceInitialiser_GUI juceInit;
+    std::cout << "initialised" << std::endl;
 
     const auto inputName = String ("BlackHole 2ch"), outputName = String ("BlackHole 16ch");
 

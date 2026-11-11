@@ -596,21 +596,93 @@ public:
             expectTimestamp (blocks.next (pair (2'016'000'000, 1792), noOffset), { 2'016'000'000, 0, 0 });
         }
 
-        beginTest ("A pair ahead of the tracked start names the current block: the tracking moves up to it");
+        // F2 (SPEC "Rulings on the prosecution review"): a pair the tracking cannot reconcile is
+        // absent, and the next valid pair anchors again with nativeDiscontinuity. Expected values
+        // from the rails author's Python oracle of that rule (2026-11-11); W1a and W1b are the
+        // prosecution's witnesses (review-witnesses/repro.cpp), where the replaced rule moved the
+        // tracking and every later offset was wrong, unflagged.
+        constexpr int64_t period = 5'333'333;
+        constexpr auto discontinuity = AudioIODeviceTimestamp::nativeDiscontinuity;
+
+        beginTest ("A pair ahead of the tracked start (the next switch's pair read early, or missed switches) is absent, then the tracking anchors again");
         {
+            // W1b: switch 5 is handed switch 6's pair (true offset +256, not 0)
+            constexpr int64_t t = 1'000'000'000;
             AsioBlockTimes blocks;
             blocks.reset (256);
 
-            // the first pair was stale (1000 for a block at 1256): tracked 1256, then the pair at 1512 is ahead
-            expectTimestamp (blocks.next (pair (3'000'000'000, 1000), noOffset), { 3'000'000'000, 0, 0 });
-            expectTimestamp (blocks.next (pair (3'010'666'667, 1512), noOffset), { 3'010'666'667, 0, 0 });
-            expectTimestamp (blocks.next (pair (3'010'666'667, 1512), noOffset), { 3'010'666'667, -256, 0 });
+            for (int k = 0; k < 5; ++k)
+                expectTimestamp (blocks.next (pair (t + k * period, k * 256), noOffset), { t + k * period, 0, 0 });
+
+            expectAbsent    (blocks.next (pair (t + 6 * period, 6 * 256), noOffset));
+            expectTimestamp (blocks.next (pair (t + 6 * period, 6 * 256), noOffset), { 1'031'999'998, 0, discontinuity });
+            expectTimestamp (blocks.next (pair (t + 7 * period, 7 * 256), noOffset), { 1'037'333'331, 0, 0 });
+
+            for (int k = 8; k < 5000; ++k)
+                blocks.next (pair (t + k * period, k * 256), noOffset);
+
+            expectTimestamp (blocks.next (pair (t + 5000 * period, 5000 * 256), noOffset), { 27'666'665'000, 0, 0 });
 
             // a missed switch: tracked 768, the pair says 1024
             AsioBlockTimes skipped;
             skipped.reset (256);
             expectTimestamp (skipped.next (pair (4'000'000'000, 512),  noOffset), { 4'000'000'000, 0, 0 });
-            expectTimestamp (skipped.next (pair (4'010'666'667, 1024), noOffset), { 4'010'666'667, 0, 0 });
+            expectAbsent    (skipped.next (pair (4'010'666'667, 1024), noOffset));
+            expectTimestamp (skipped.next (pair (4'016'000'000, 1280), noOffset), { 4'016'000'000, 0, discontinuity });
+            expectTimestamp (skipped.next (pair (4'021'333'333, 1536), noOffset), { 4'021'333'333, 0, 0 });
+        }
+
+        beginTest ("A position before the newest one seen (a rewind) is absent, then the tracking anchors again");
+        {
+            // W1a: the driver's position falls back to 0 (with kSampleRateChanged), then counts on from there
+            AsioBlockTimes blocks;
+            blocks.reset (256);
+            int64_t t = 1'000'000'000;
+
+            expectTimestamp (blocks.next (pair (t, 1'000'000), noOffset), { 1'000'000'000, 0, 0 });
+            expectTimestamp (blocks.next (pair (t += period, 1'000'256), noOffset), { 1'005'333'333, 0, 0 });
+
+            auto rewound = pair (t += period, 0);
+            rewound.sampleRateChanged = true;
+            expectAbsent    (blocks.next (rewound, noOffset));
+            expectTimestamp (blocks.next (pair (t += period, 256), noOffset), { 1'015'999'999, 0, discontinuity });
+
+            for (int k = 4; k < 1000; ++k)
+                blocks.next (pair (t += period, (k - 2) * 256), noOffset);
+
+            expectTimestamp (blocks.next (pair (t += period, 998 * 256), noOffset), { 6'333'333'000, 0, 0 });
+
+            // a rewind to a whole number of blocks before the tracked start: 0, with 1536 tracked
+            AsioBlockTimes aligned;
+            aligned.reset (256);
+            expectTimestamp (aligned.next (pair (2'000'000'000, 1024), noOffset), { 2'000'000'000, 0, 0 });
+            expectTimestamp (aligned.next (pair (2'005'333'333, 1280), noOffset), { 2'005'333'333, 0, 0 });
+            expectAbsent    (aligned.next (pair (2'010'666'667, 0),    noOffset));
+            expectTimestamp (aligned.next (pair (2'016'000'000, 256),  noOffset), { 2'016'000'000, 0, discontinuity });
+            expectTimestamp (aligned.next (pair (2'021'333'333, 512),  noOffset), { 2'021'333'333, 0, 0 });
+        }
+
+        beginTest ("A position not a whole number of blocks from the tracked start is absent; the flag waits for the next delivered observation");
+        {
+            // tracked 1280, the pair says 1100; the next pair, 1600, is the new anchor
+            AsioBlockTimes blocks;
+            blocks.reset (256);
+            expectTimestamp (blocks.next (pair (3'000'000'000, 1024), noOffset), { 3'000'000'000, 0, 0 });
+            expectAbsent    (blocks.next (pair (3'005'333'333, 1100), noOffset));
+            expectTimestamp (blocks.next (pair (3'010'666'667, 1600), noOffset), { 3'010'666'667, 0, discontinuity });
+            expectTimestamp (blocks.next (pair (3'016'000'000, 1856), noOffset), { 3'016'000'000, 0, 0 });
+
+            // the anchoring switch has no valid system time: the next observation delivered carries the flag
+            AsioBlockTimes waiting;
+            waiting.reset (256);
+            auto anchorWithoutTime = pair (4'010'666'667, 1256);
+            anchorWithoutTime.systemTimeValid = false;
+
+            expectTimestamp (waiting.next (pair (4'000'000'000, 0), noOffset), { 4'000'000'000, 0, 0 });
+            expectAbsent    (waiting.next (pair (4'005'333'333, 1000), noOffset));
+            expectAbsent    (waiting.next (anchorWithoutTime, noOffset));
+            expectTimestamp (waiting.next (pair (4'016'000'000, 1512), noOffset), { 4'016'000'000, 0, discontinuity });
+            expectTimestamp (waiting.next (pair (4'021'333'333, 1768), noOffset), { 4'021'333'333, 0, 0 });
         }
 
         beginTest ("Both halves of the system time and the sample position count, the low halves as unsigned");

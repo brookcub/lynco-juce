@@ -398,18 +398,32 @@ struct AsioSwitchTime
     reset (blockSize) starts a run (open/start); nothing from an earlier run is kept.
 
     next() is called once for every buffer switch, in order. Both 64-bit values are their two
-    32-bit halves combined as unsigned. Block-start bookkeeping: the first switch with a valid
-    sample position sets the tracked start to that position; every later switch first advances the
-    tracked start by blockSize, then, if its position is valid and greater, moves it up to that
-    position (a driver's pair never names a later block than the current one; a pair ahead of the
-    tracking means switches were missed). An invalid position still counts as a switch.
+    32-bit halves combined as unsigned.
 
-    The observation: timeNs = systemTime + clockOffsetNs; sampleOffset = samplePosition - tracked
-    start (0 for this switch's own pair, -blockSize for the previous switch's, ...); nativeFlags =
-    nativeDiscontinuity if sampleRateChanged or clockSourceChanged, else 0.
+    Block-start bookkeeping (SPEC "Rulings on the prosecution review", F2). The first switch of
+    the run with a valid sample position anchors the tracking: the tracked start, and the newest
+    position seen, are that position. Every later switch advances the tracked start by blockSize;
+    an invalid position still counts as a switch. A valid position p is reconciled with the
+    tracking when it is
+      - not before the newest position seen (a position never goes back),
+      - not after the tracked start (a pair ahead of the tracking cannot be told apart: missed
+        switches, or the next switch's pair read early), and
+      - a whole number of blocks before the tracked start;
+    then sampleOffset = p - tracked start (0 for this switch's own pair, -blockSize for the
+    previous switch's, ...) and p is the newest position seen. A valid position that is not
+    reconciled loses the tracking: that switch has no observation, and the next switch with a
+    valid position anchors the tracking again, as at the start of a run (offset 0). The first
+    observation delivered after a loss carries nativeDiscontinuity, whichever switch delivers it.
 
-    nullopt if the system time or the sample position is not valid, there is no clock offset, or
-    no valid position has been seen in this run.
+    The observation: timeNs = systemTime + clockOffsetNs; sampleOffset as above; nativeFlags =
+    nativeDiscontinuity if sampleRateChanged or clockSourceChanged, or if it is the first
+    observation since a loss, else 0.
+
+    nullopt if the system time or the sample position is not valid, there is no clock offset, no
+    valid position has been seen in this run, or the position is not reconciled.
+
+    Known limit: an anchoring pair is taken to be its own switch's. If it is stale, the offsets
+    are whole blocks too high until a pair ahead of the tracking causes a new anchor.
 
     Implementers may add private members; the public interface is fixed.
 */

@@ -403,6 +403,83 @@ inline std::optional<AudioIODeviceTimestamp> getAsioProcessingCycle (bool system
     return AudioIODeviceTimestamp { systemTimeNs + *clockOffsetNs, 0, 0 };
 }
 
+/*  SPEC "ASIO: hardware findings and revision" (P021 revised). The getAsioProcessingCycle above is
+    superseded by the two seams below; P021's builder deletes it with the backend's old wiring.
+
+    One buffer switch's native pair: from the ASIOTime that bufferSwitchTimeInfo delivers for that
+    switch, or, for a driver that calls the plain bufferSwitch, from ASIOGetSamplePosition (its
+    success sets both valid flags; it has no change flags).
+*/
+struct AsioSwitchTime
+{
+    bool systemTimeValid = false, samplePositionValid = false;   // kSystemTimeValid, kSamplePositionValid
+    uint32_t systemTimeHi = 0, systemTimeLo = 0;                 // ASIOTimeStamp halves: ns on the driver's clock
+    uint32_t samplePositionHi = 0, samplePositionLo = 0;         // ASIOSamples halves: the pair's sample position
+    bool sampleRateChanged = false, clockSourceChanged = false;  // kSampleRateChanged, kClockSourceChanged
+};
+
+/*  The processing-cycle observation of each buffer switch of a run, on the callback thread.
+
+    reset (blockSize) starts a run (open/start); nothing from an earlier run is kept.
+
+    next() is called once for every buffer switch, in order. Both 64-bit values are their two
+    32-bit halves combined as unsigned. Block-start bookkeeping: the first switch with a valid
+    sample position sets the tracked start to that position; every later switch first advances the
+    tracked start by blockSize, then, if its position is valid and greater, moves it up to that
+    position (a driver's pair never names a later block than the current one; a pair ahead of the
+    tracking means switches were missed). An invalid position still counts as a switch.
+
+    The observation: timeNs = systemTime + clockOffsetNs; sampleOffset = samplePosition - tracked
+    start (0 for this switch's own pair, -blockSize for the previous switch's, ...); nativeFlags =
+    nativeDiscontinuity if sampleRateChanged or clockSourceChanged, else 0.
+
+    nullopt if the system time or the sample position is not valid, there is no clock offset, or
+    no valid position has been seen in this run.
+
+    Implementers may add private members; the public interface is fixed.
+*/
+class AsioBlockTimes
+{
+public:
+    void reset (int blockSize) noexcept
+    {
+        ignoreUnused (blockSize);    // P021 implements
+    }
+
+    std::optional<AudioIODeviceTimestamp> next (const AsioSwitchTime& switchTime, std::optional<int64_t> clockOffsetNs) noexcept
+    {
+        ignoreUnused (switchTime, clockOffsetNs);
+        return {};    // P021 implements
+    }
+};
+
+/*  Three candidate clocks, read back to back at the instant timeGetTime()'s value changes, after
+    the driver times were read: QPC (as Time::getHighResolutionTicks() in ns), interrupt time
+    (QueryInterruptTimePrecise x 100) and timeGetTime() x 1'000'000, all in ns.
+*/
+struct AsioClockCandidates
+{
+    int64_t qpcNs, interruptTimeNs, timeGetTimeNs;
+};
+
+/*  Identifies the driver's systemTime clock once per run and returns the offset to add to it to
+    reach the QPC timeline (candidates.qpcNs - the matching candidate), or nullopt (the role is
+    absent for the run).
+
+    driverTimesNs: successive system times of the run, oldest first. Needs at least 8. If every one
+    is a whole millisecond the only candidate is timeGetTime; otherwise the candidates are QPC and
+    interrupt time. A candidate c matches if the newest driver time t has c - maxAgeNs <= t <= c
+    (the driver's time is of a switch that has already happened, at most maxAgeNs earlier). Exactly
+    one candidate must match; none, or two (QPC and interrupt time closer together than maxAgeNs),
+    give nullopt.
+*/
+inline std::optional<int64_t> identifyAsioClockOffset (const int64_t* driverTimesNs, int numDriverTimes,
+                                                       const AsioClockCandidates& candidates, int64_t maxAgeNs) noexcept
+{
+    ignoreUnused (driverTimesNs, numDriverTimes, candidates, maxAgeNs);
+    return {};    // P021 implements
+}
+
 //==============================================================================
 /** One snd_pcm_htimestamp reading: availFrames were available when the hardware pointer was last
     updated, at tstamp (seconds and nanoseconds).

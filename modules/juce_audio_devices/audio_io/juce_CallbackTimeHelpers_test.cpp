@@ -540,48 +540,215 @@ private:
 static CombinedOutputCorrespondenceTests combinedOutputCorrespondenceTests;
 
 //==============================================================================
-/*  Acceptance tests for P021 (ASIO processing-cycle time). The driver time and clock offset are
-    fakes; expected times are their sums, worked by hand. Whether the offset is right for a given
-    driver is a hardware check (RAILS.md), not a unit test.
+/*  Acceptance tests for P021 (ASIO processing-cycle time), revised per SPEC "ASIO: hardware
+    findings and revision". Pairs, clock readings and offsets are fakes; expected values are
+    hand-worked integers, checked with Python on 2026-11-11 (rails author's oracle run). Numbers of
+    the measured size: interrupt time 118'186.640 ms behind QPC and timeGetTime 118'195 ms behind
+    (hw-windows/RESULTS.md, Focusrite, 2026-11-11); 256-frame blocks at 48 kHz (5'333'333 ns).
+    Whether a driver's clock really is the one identified stays a hardware check (RAILS.md).
 */
 class AsioProcessingCycleTests final : public UnitTest
 {
 public:
     AsioProcessingCycleTests() : UnitTest ("ASIO processing cycle timestamps", UnitTestCategories::audio) {}
 
+    static AsioSwitchTime pair (uint32_t systemHi, uint32_t systemLo, uint32_t positionHi, uint32_t positionLo)
+    {
+        AsioSwitchTime t;
+        t.systemTimeValid = t.samplePositionValid = true;
+        t.systemTimeHi = systemHi;
+        t.systemTimeLo = systemLo;
+        t.samplePositionHi = positionHi;
+        t.samplePositionLo = positionLo;
+        return t;
+    }
+
+    // A pair from whole values (split into halves as the driver delivers them)
+    static AsioSwitchTime pair (int64_t systemNs, int64_t position)
+    {
+        return pair ((uint32_t) (systemNs >> 32), (uint32_t) systemNs, (uint32_t) (position >> 32), (uint32_t) position);
+    }
+
     void runTest() override
     {
-        beginTest ("The block's system time plus the run's clock offset, at offset 0");
+        constexpr int64_t noOffset = 0;
+
+        beginTest ("This switch's own pair: its system time plus the run's clock offset, at offset 0");
         {
-            expectTimestamp (getAsioProcessingCycle (true, 0, 1'000'000'000, 5'000), { 1'000'005'000, 0, 0 });
-            expectTimestamp (getAsioProcessingCycle (true, 0, 1'000'000'000, -1'000'000'000), { 0, 0, 0 });
+            AsioBlockTimes blocks;
+            blocks.reset (256);
+
+            // hi 205, lo 0x4F1B5F8C: 881'795'489'676 ns on the interrupt-time clock, + 118'186'640'000
+            expectTimestamp (blocks.next (pair (205, 0x4F1B5F8Cu,             0, 0),   118'186'640'000), { 999'982'129'676, 0, 0 });
+            expectTimestamp (blocks.next (pair (205, 0x4F1B5F8Cu + 5'333'333, 0, 256), 118'186'640'000), { 999'987'463'009, 0, 0 });
+            expectTimestamp (blocks.next (pair (205, 0x4F1B5F8Cu + 10'666'666, 0, 512), 118'186'640'000), { 999'992'796'342, 0, 0 });
         }
 
-        beginTest ("Both halves of the system time count, the low half as unsigned");
+        beginTest ("The previous switch's pair, repeated: its time, at its offset from this block's start");
         {
-            // hi = 2, lo = 0x80000000: 2 * 2^32 + 2^31 = 10,737,418,240 ns
-            expectTimestamp (getAsioProcessingCycle (true, 2, 0x80000000u, 0), { 10'737'418'240, 0, 0 });
-            // hi = 0x00010000, lo = 0xffffffff: 2^48 + 2^32 - 1 = 281,479,271,677,951 ns
-            expectTimestamp (getAsioProcessingCycle (true, 0x00010000u, 0xffffffffu, 0), { 281'479'271'677'951, 0, 0 });
+            AsioBlockTimes blocks;
+            blocks.reset (256);
+
+            // back-to-back switches that get the same pair: blocks start at 1024, 1280, 1536, then 1792
+            expectTimestamp (blocks.next (pair (2'000'000'000, 1024), noOffset), { 2'000'000'000, 0, 0 });
+            expectTimestamp (blocks.next (pair (2'000'000'000, 1024), noOffset), { 2'000'000'000, -256, 0 });
+            expectTimestamp (blocks.next (pair (2'000'000'000, 1024), noOffset), { 2'000'000'000, -512, 0 });
+            expectTimestamp (blocks.next (pair (2'016'000'000, 1792), noOffset), { 2'016'000'000, 0, 0 });
         }
 
-        beginTest ("The same offset gives every block of a run the driver's own spacing");
+        beginTest ("A pair ahead of the tracked start names the current block: the tracking moves up to it");
         {
-            const auto a = getAsioProcessingCycle (true, 1, 100, 123'456'789);
-            const auto b = getAsioProcessingCycle (true, 1, 100 + 10'000'000, 123'456'789);
-            expect (a.has_value() && b.has_value() && b->timeNs - a->timeNs == 10'000'000);
-            expectTimestamp (a, { 4'294'967'296 + 100 + 123'456'789, 0, 0 });
+            AsioBlockTimes blocks;
+            blocks.reset (256);
+
+            // the first pair was stale (1000 for a block at 1256): tracked 1256, then the pair at 1512 is ahead
+            expectTimestamp (blocks.next (pair (3'000'000'000, 1000), noOffset), { 3'000'000'000, 0, 0 });
+            expectTimestamp (blocks.next (pair (3'010'666'667, 1512), noOffset), { 3'010'666'667, 0, 0 });
+            expectTimestamp (blocks.next (pair (3'010'666'667, 1512), noOffset), { 3'010'666'667, -256, 0 });
+
+            // a missed switch: tracked 768, the pair says 1024
+            AsioBlockTimes skipped;
+            skipped.reset (256);
+            expectTimestamp (skipped.next (pair (4'000'000'000, 512),  noOffset), { 4'000'000'000, 0, 0 });
+            expectTimestamp (skipped.next (pair (4'010'666'667, 1024), noOffset), { 4'010'666'667, 0, 0 });
         }
 
-        beginTest ("No valid system time, or no established clock offset, gives nothing");
+        beginTest ("Both halves of the system time and the sample position count, the low halves as unsigned");
         {
-            expectTimestamp (getAsioProcessingCycle (true, 0, 1'000, 0), { 1'000, 0, 0 });
-            expectAbsent (getAsioProcessingCycle (false, 0, 1'000, 0));
-            expectAbsent (getAsioProcessingCycle (true, 0, 1'000, std::nullopt));
+            AsioBlockTimes blocks;
+            blocks.reset (256);
+
+            // time 2 * 2^32 + 2^31 = 10'737'418'240; position 2^32 + 2^31 = 6'442'450'944
+            expectTimestamp (blocks.next (pair (2, 0x80000000u, 1, 0x80000000u), noOffset), { 10'737'418'240, 0, 0 });
+            // time 2^48 + 2^32 - 1 = 281'479'271'677'951; position 6'442'451'200, the next block
+            expectTimestamp (blocks.next (pair (0x00010000u, 0xffffffffu, 1, 0x80000100u), noOffset), { 281'479'271'677'951, 0, 0 });
+        }
+
+        beginTest ("An invalid sample position gives nothing, and the switch still counts");
+        {
+            AsioBlockTimes blocks;
+            blocks.reset (256);
+
+            auto noPosition = pair (5'005'333'333, 0);
+            noPosition.samplePositionValid = false;
+
+            expectTimestamp (blocks.next (pair (5'000'000'000, 0), noOffset), { 5'000'000'000, 0, 0 });
+            expectAbsent    (blocks.next (noPosition, noOffset));
+            // the first pair again, two switches on: -512 (-256 if the invalid switch had not counted)
+            expectTimestamp (blocks.next (pair (5'000'000'000, 0), noOffset), { 5'000'000'000, -512, 0 });
+        }
+
+        beginTest ("Nothing before a valid position in the run, without a valid system time, or without a clock offset");
+        {
+            AsioBlockTimes blocks;
+            blocks.reset (256);
+
+            auto noPosition = pair (6'000'000'000, 0);
+            noPosition.samplePositionValid = false;
+            auto noTime = pair (6'005'333'333, 256);
+            noTime.systemTimeValid = false;
+
+            expectAbsent    (blocks.next (noPosition, noOffset));                      // no block start yet
+            expectAbsent    (blocks.next (noTime, noOffset));                          // position 256 sets it
+            expectAbsent    (blocks.next (pair (6'010'666'667, 512), std::nullopt));   // no clock offset
+            expectTimestamp (blocks.next (pair (6'016'000'000, 768), noOffset), { 6'016'000'000, 0, 0 });
+        }
+
+        beginTest ("A sample-rate or clock-source change sets nativeDiscontinuity on that switch only");
+        {
+            AsioBlockTimes blocks;
+            blocks.reset (256);
+
+            auto rate = pair (7'000'000'000, 0);
+            rate.sampleRateChanged = true;
+            auto source = pair (7'005'333'333, 256);
+            source.clockSourceChanged = true;
+
+            expectTimestamp (blocks.next (rate, noOffset),   { 7'000'000'000, 0, AudioIODeviceTimestamp::nativeDiscontinuity });
+            expectTimestamp (blocks.next (source, noOffset), { 7'005'333'333, 0, AudioIODeviceTimestamp::nativeDiscontinuity });
+            expectTimestamp (blocks.next (pair (7'010'666'667, 512), noOffset), { 7'010'666'667, 0, 0 });
+        }
+
+        beginTest ("reset starts a new run: no block start is kept");
+        {
+            AsioBlockTimes blocks;
+            blocks.reset (256);
+            expectTimestamp (blocks.next (pair (8'000'000'000, 4096), noOffset), { 8'000'000'000, 0, 0 });
+            expectTimestamp (blocks.next (pair (8'005'333'333, 4352), noOffset), { 8'005'333'333, 0, 0 });
+
+            blocks.reset (256);
+            expectTimestamp (blocks.next (pair (9'000'000'000, 100), noOffset), { 9'000'000'000, 0, 0 });
+        }
+
+        // Clock identification. Candidates as measured: QPC 1000 s, interrupt time 118'186.640 ms
+        // behind, timeGetTime 118'195 ms behind. maxAge: two 256-frame blocks + 32 ms.
+        constexpr AsioClockCandidates now { 1'000'000'000'000, 881'813'360'000, 881'805'000'000 };
+        constexpr int64_t maxAge = 2 * 5'333'333 + 32'000'000;
+
+        beginTest ("An interrupt-time driver: the offset is QPC - interrupt time");
+        {
+            expectOffset (identify (times (now.interruptTimeNs - 3'100'300), now, maxAge), 118'186'640'000);
+
+            // whole milliseconds near timeGetTime, but one time is not: not a timeGetTime clock, and
+            // interrupt time (13.36 ms later) matches
+            auto mixed = times (now.timeGetTimeNs - 5'000'000, 5'000'000);
+            mixed[3] += 100;
+            expectOffset (identify (mixed, now, maxAge), 118'186'640'000);
+        }
+
+        beginTest ("A QPC driver: the offset is 0");
+        {
+            expectOffset (identify (times (now.qpcNs - 1'234'567), now, maxAge), 0);
+        }
+
+        beginTest ("A timeGetTime driver (every time a whole millisecond): the offset is QPC - timeGetTime");
+        {
+            expectOffset (identify (times (now.timeGetTimeNs - 5'000'000, 5'000'000), now, maxAge), 118'195'000'000);
+            expectOffset (identify (times (now.timeGetTimeNs - 60'000'000, 5'000'000), now, maxAge), std::nullopt);
+        }
+
+        beginTest ("No candidate, two candidates, or fewer than 8 times: nothing for the run");
+        {
+            expectOffset (identify (times (now.qpcNs - 200'000'000'000), now, maxAge), std::nullopt);
+
+            // QPC and interrupt time 20 ms apart: a time 3 ms before interrupt time matches both
+            constexpr AsioClockCandidates close { 1'000'000'000'000, 999'980'000'000, 999'975'000'000 };
+            expectOffset (identify (times (close.interruptTimeNs - 3'000'100), close, maxAge), std::nullopt);
+
+            const auto seven = times (now.interruptTimeNs - 3'100'300);
+            expectOffset (identifyAsioClockOffset (seven.data() + 1, 7, now, maxAge), std::nullopt);
+        }
+
+        beginTest ("A candidate matches from maxAge before it up to its own reading");
+        {
+            expectOffset (identify (times (now.interruptTimeNs - maxAge), now, maxAge), 118'186'640'000);
+            expectOffset (identify (times (now.interruptTimeNs - maxAge - 1), now, maxAge), std::nullopt);
+            expectOffset (identify (times (now.interruptTimeNs), now, maxAge), 118'186'640'000);
+            expectOffset (identify (times (now.interruptTimeNs + 1), now, maxAge), std::nullopt);
         }
     }
 
+    // Eight driver times ending at newest, step apart, oldest first
+    static std::vector<int64_t> times (int64_t newest, int64_t step = 5'333'300)
+    {
+        std::vector<int64_t> t;
+        for (int k = 7; k >= 0; --k)
+            t.push_back (newest - step * k);
+        return t;
+    }
+
+    static std::optional<int64_t> identify (const std::vector<int64_t>& t, const AsioClockCandidates& c, int64_t maxAge)
+    {
+        return identifyAsioClockOffset (t.data(), (int) t.size(), c, maxAge);
+    }
+
 private:
+    void expectOffset (std::optional<int64_t> actual, std::optional<int64_t> expected)
+    {
+        const auto text = [] (std::optional<int64_t> v) { return v.has_value() ? String (*v) : String ("absent"); };
+        expect (actual == expected, "got " + text (actual) + ", expected " + text (expected));
+    }
+
     void expectTimestamp (const std::optional<AudioIODeviceTimestamp>& actual, const AudioIODeviceTimestamp& expected)
     {
         expect (actual.has_value() && isSameTimestamp (*actual, expected), "got " + describe (actual) + ", expected " + describe (expected));

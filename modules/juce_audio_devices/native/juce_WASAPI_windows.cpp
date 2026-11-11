@@ -1088,11 +1088,15 @@ inline std::optional<AudioIODeviceTimestamp> getRenderTimestamp (HRESULT getPosi
 class RenderStreamCorrespondence
 {
 public:
-    void reset() noexcept {}                                                         // P009.1 implements
-    void released (int64_t numFrames) noexcept                { ignoreUnused (numFrames); }
-    void paddingBeforeWrite (int64_t paddingFrames) noexcept  { ignoreUnused (paddingFrames); }
-    void lose() noexcept {}
-    std::optional<int64_t> callbackStart() const noexcept     { return {}; }
+    void reset() noexcept                                     { numReleased = 0; isLost = false; }
+    void released (int64_t numFrames) noexcept                { numReleased += numFrames; }
+    void paddingBeforeWrite (int64_t paddingFrames) noexcept  { if (paddingFrames == 0 && numReleased > 0) isLost = true; }
+    void lose() noexcept                                      { isLost = true; }
+    std::optional<int64_t> callbackStart() const noexcept     { return isLost ? std::nullopt : std::optional<int64_t> (numReleased); }
+
+private:
+    int64_t numReleased = 0;
+    bool isLost = false;
 };
 
 //==============================================================================
@@ -1261,8 +1265,8 @@ public:
 
     bool open (double newSampleRate, const BigInteger& newChannels, int bufferSizeSamples)
     {
-        numFramesReleased = 0;
-        isCorrespondenceLost = false;
+        correspondence.reset();
+        hasWrittenBlock = false;
 
         if (! (openClient (newSampleRate, newChannels, bufferSizeSamples)
                 && (numChannels == 0 || check (client->GetService (__uuidof (IAudioRenderClient),
@@ -1288,17 +1292,21 @@ public:
     /*  Every frame this device releases to the render client, from the silence in start() on,
         is part of one stream, and copyBuffers releases the frames of a callback in order, one
         native write after another, however many it takes. So the first frame of the next
-        callback is the frame at index numFramesReleased in that stream, whether the callback's
-        frames then go out in one write or several, whether the wait for space is in shared
-        mode (the engine's padding) or exclusive mode (the event), and in low-latency mode,
+        callback is the frame at index correspondence.callbackStart() in that stream, whether the
+        callback's frames then go out in one write or several, whether the wait for space is in
+        shared mode (the engine's padding) or exclusive mode (the event), and in low-latency mode,
         which is a shared stream.
 
-        IAudioClock's position counts the frames of that stream that have been presented. Measured
-        on a shared-mode render stream, it stays put while the engine plays silence of its own
-        after the application has run dry, and carries on from the same place with the next frame
-        submitted, so an underrun does not break the correspondence. If a position is ever ahead
-        of the frames released, the clock has counted something that is not in the stream, and
-        the correspondence is given up until the device is opened again.
+        IAudioClock's position counts the frames of that stream that have been presented, and
+        while the application keeps the engine supplied its (position, QPC) pair is the stream's
+        presentation. Measured on a shared-mode render stream, after the application has run dry
+        the position stays put while the engine plays silence of its own and carries on from the
+        same place, but its pair no longer matches presentation (the output ends up 8-16 ms off,
+        for the rest of the run). So from the first write, after the first block, that finds the
+        engine's buffer empty, or if a position is ever ahead of the frames released, the clock
+        has counted something that is not in the stream, and the observation is absent until the
+        device is opened again (the first block may find the engine through start()'s silence:
+        that is start-up, forwarded as the clock gives it). The input role is not affected and does not depend on this.
 
         Nothing is projected: the observation is the clock's own pair, aligned to the nearest
         frame by getRenderTimestamp.
@@ -1313,10 +1321,10 @@ public:
         const auto result = audioClock->GetPosition (&position, &qpc);
 
         if (SUCCEEDED (result) && isAheadOfReleasedFrames (position))
-            isCorrespondenceLost = true;
+            correspondence.lose();
 
         return getRenderTimestamp (result, position, qpc, clockFrequency, std::llround (sampleRate),
-                                   isCorrespondenceLost ? std::nullopt : std::optional<int64_t> (numFramesReleased));
+                                   correspondence.callbackStart());
     }
 
     template <class DestType>
@@ -1342,7 +1350,7 @@ public:
         if (check (renderClient->GetBuffer ((UINT32) samplesToDo, &outputData)))
         {
             renderClient->ReleaseBuffer ((UINT32) samplesToDo, AUDCLNT_BUFFERFLAGS_SILENT);
-            numFramesReleased += samplesToDo;
+            correspondence.released (samplesToDo);
         }
 
         if (! check (client->Start()))
@@ -1353,7 +1361,8 @@ public:
         return true;
     }
 
-    int getNumSamplesAvailableToCopy() const
+    // In shared mode the padding found here is the one before the write that follows
+    int getNumSamplesAvailableToCopy()
     {
         if (numChannels <= 0)
             return 0;
@@ -1363,7 +1372,14 @@ public:
             UINT32 padding = 0;
 
             if (check (client->GetCurrentPadding (&padding)))
+            {
+                // The first block can find the engine already through start()'s silence, as the
+                // application's first callback is later than that; that is start-up, not a lapse
+                if (hasWrittenBlock)
+                    correspondence.paddingBeforeWrite (padding);
+
                 return (int) actualBufferSize - (int) padding;
+            }
         }
 
         return (int) actualBufferSize;
@@ -1408,7 +1424,8 @@ public:
                     converter->convertSamples (outputData, channelMaps.getUnchecked (i), srcBuffers[i] + offset, 0, samplesToDo);
 
                 renderClient->ReleaseBuffer ((UINT32) samplesToDo, 0);
-                numFramesReleased += samplesToDo;
+                correspondence.released (samplesToDo);
+                hasWrittenBlock = true;
             }
 
             bufferSize -= samplesToDo;
@@ -1422,14 +1439,14 @@ public:
         const auto rate = (UINT64) std::llround (sampleRate);
         const auto frames = (position / clockFrequency) * rate + (position % clockFrequency) * rate / clockFrequency;
 
-        return frames > (UINT64) numFramesReleased;
+        return frames > (UINT64) correspondence.callbackStart().value_or (std::numeric_limits<int64_t>::max());
     }
 
     ComSmartPtr<IAudioRenderClient> renderClient;
     ComSmartPtr<IAudioClock> audioClock;
     UINT64 clockFrequency = 0;
-    int64 numFramesReleased = 0;
-    bool isCorrespondenceLost = false;
+    RenderStreamCorrespondence correspondence;
+    bool hasWrittenBlock = false;   // a callback's frames have been released since the device opened
     std::unique_ptr<AudioData::Converter> converter;
 
 private:

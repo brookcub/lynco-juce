@@ -186,6 +186,54 @@ inline AudioIODeviceCallbackContext getCombinedCallbackContext ([[maybe_unused]]
 }
 
 //==============================================================================
+/*  Which application output frame an AudioIODeviceCombiner's output device presented, so that the
+    application's callback can carry the output device's inOutputTime.
+
+    The application's callback runs from the input device and writes its output to the combiner's
+    FIFO; the output device's callback reads the FIFO later, on its own thread, and its stamp names
+    the first frame of what it read. Both sides use the FIFO's absolute addresses. While the
+    application's buffers occupy consecutive addresses, the distance between two addresses is the
+    distance between their frames, so an observation read at address A is at offset A - W for an
+    application buffer written at address W. The latest observation is repeated until a newer one
+    replaces it.
+
+    Called from both devices' threads; the implementation must not lock or allocate.
+
+    Stub: the patch that implements it is P014.1.
+*/
+class CombinedOutputCorrespondence
+{
+public:
+    /*  Forgets the correspondence, as when the device starts or an xrun invalidates both FIFO
+        positions. There is no observation until frames are written and a stamped frame is read again.
+    */
+    void reset() noexcept {}
+
+    /*  The application's buffer of numFrames frames went to FIFO addresses [writeStart, writeStart +
+        numFrames). A write that does not follow the previous one (frames were dropped or the addresses
+        jumped) loses the correspondence, as reset() does, and starts a new run of addresses.
+    */
+    void wrote ([[maybe_unused]] uint64_t writeStart, [[maybe_unused]] int numFrames) noexcept {}
+
+    /*  The output device's callback filled numFrames frames: the first numPaddingFrames of them with
+        silence, and the rest from FIFO addresses readStart + numPaddingFrames onwards. outputStamp is
+        that callback's output observation, relative to its own buffer. It becomes the observation if
+        the frame it stamps was read from the FIFO in this callback (not padding) and was written by
+        the application since the last reset; otherwise the previous observation is kept.
+    */
+    void read ([[maybe_unused]] uint64_t readStart,
+               [[maybe_unused]] int numFrames,
+               [[maybe_unused]] int numPaddingFrames,
+               [[maybe_unused]] const std::optional<AudioIODeviceTimestamp>& outputStamp) noexcept {}
+
+    /*  The output observation for the application buffer about to be written at writeStart: the
+        latest observation's time and flags, at offset (its address - writeStart). nullopt if there is
+        no observation, or writeStart does not continue the run of addresses written since the reset.
+    */
+    std::optional<AudioIODeviceTimestamp> observationFor ([[maybe_unused]] uint64_t writeStart) const noexcept { return {}; }
+};
+
+//==============================================================================
 /*  The processing-cycle observation of an ASIO buffer switch: the current block's systemTime, at
     offset 0. systemTime is the ASIOTimeStamp's two 32-bit halves (ns on the driver's clock), and
     clockOffsetNs the offset from the driver's clock to the Time::getHighResolutionTicks() timeline,

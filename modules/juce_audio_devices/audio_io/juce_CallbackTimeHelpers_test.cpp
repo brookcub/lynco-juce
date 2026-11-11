@@ -410,6 +410,136 @@ private:
 static CoreAudioChunkTimestampTests coreAudioChunkTimestampTests;
 
 //==============================================================================
+/*  Acceptance tests for P014.1's combined-device output role. FIFO addresses, stamps and times are
+    fakes; each expected offset is the stamped frame's FIFO address minus the application buffer's,
+    worked by hand.
+*/
+class CombinedOutputCorrespondenceTests final : public UnitTest
+{
+public:
+    CombinedOutputCorrespondenceTests() : UnitTest ("CoreAudio combined output timestamps", UnitTestCategories::audio) {}
+
+    void runTest() override
+    {
+        using Ts = AudioIODeviceTimestamp;
+        const Ts stamp { 5'000'000'000, 0, 0 };
+
+        beginTest ("The output device's stamp is at its frame's address minus the application buffer's");
+        {
+            CombinedOutputCorrespondence c;
+            c.wrote (1000, 512);
+            c.read (1000, 512, 0, stamp);
+            expectTimestamp (c.observationFor (1512), { 5'000'000'000, -512, 0 });
+        }
+
+        beginTest ("An output device several buffers behind gives a further negative offset, repeated until replaced");
+        {
+            CombinedOutputCorrespondence c;
+            c.wrote (1000, 512);
+            c.wrote (1512, 512);
+            c.wrote (2024, 512);
+            c.read (1512, 256, 0, stamp);
+            expectTimestamp (c.observationFor (2536), { 5'000'000'000, -1024, 0 });
+
+            c.wrote (2536, 512);
+            expectTimestamp (c.observationFor (3048), { 5'000'000'000, -1536, 0 });
+
+            c.read (1768, 256, 0, Ts { 5'005'333'333, 0, Ts::nativeReducedAccuracy });
+            expectTimestamp (c.observationFor (3048), { 5'005'333'333, -1280, Ts::nativeReducedAccuracy });
+        }
+
+        beginTest ("A stamped frame that was padding, or outside this read, gives no observation");
+        {
+            CombinedOutputCorrespondence c;
+            c.wrote (1000, 512);
+            c.read (1000, 512, 100, stamp);                         // the stamped first frame was silence
+            expectAbsent (c.observationFor (1512));
+            c.read (1000, 512, 0, Ts { 5'000'000'000, -512, 0 });  // a later chunk's view of an earlier frame
+            expectAbsent (c.observationFor (1512));
+            c.read (1000, 512, 0, std::nullopt);                    // no stamp at all
+            expectAbsent (c.observationFor (1512));
+
+            // A stamp later in the read, after the padding, is a real frame: address 1000 + 200
+            c.read (1000, 512, 100, Ts { 5'000'000'000, 200, 0 });
+            expectTimestamp (c.observationFor (1512), { 5'000'000'000, -312, 0 });
+        }
+
+        beginTest ("A frame read from an address the application has not written since the reset gives no observation");
+        {
+            CombinedOutputCorrespondence c;
+            c.wrote (1000, 512);
+            c.read (488, 512, 0, stamp);
+            expectAbsent (c.observationFor (1512));
+            c.read (1512, 512, 0, stamp);
+            expectAbsent (c.observationFor (1512));
+            c.read (1000, 512, 0, stamp);
+            expectTimestamp (c.observationFor (1512), { 5'000'000'000, -512, 0 });
+        }
+
+        beginTest ("A write that does not follow the previous one loses the correspondence until a new frame is read");
+        {
+            CombinedOutputCorrespondence c;
+            c.wrote (1000, 512);
+            c.read (1000, 512, 0, stamp);
+            c.wrote (2000, 512);                                    // addresses 1512 to 1999 were never written
+            expectAbsent (c.observationFor (2512));
+
+            c.read (1000, 512, 0, stamp);                           // a frame from before the gap does not count
+            expectAbsent (c.observationFor (2512));
+
+            c.read (2000, 512, 0, Ts { 6'000'000'000, 0, 0 });
+            expectTimestamp (c.observationFor (2512), { 6'000'000'000, -512, 0 });
+        }
+
+        beginTest ("An application buffer that does not continue the written run gets no observation");
+        {
+            CombinedOutputCorrespondence c;
+            c.wrote (1000, 512);
+            c.read (1000, 512, 0, stamp);
+            expectTimestamp (c.observationFor (1512), { 5'000'000'000, -512, 0 });
+            expectAbsent (c.observationFor (1600));
+        }
+
+        beginTest ("A reset loses the correspondence until frames are written and read again");
+        {
+            CombinedOutputCorrespondence c;
+            c.wrote (1000, 512);
+            c.read (1000, 512, 0, stamp);
+            c.reset();
+            expectAbsent (c.observationFor (1512));
+
+            c.wrote (1512, 512);
+            expectAbsent (c.observationFor (2024));
+            c.read (1512, 512, 0, Ts { 7'000'000'000, 0, 0 });
+            expectTimestamp (c.observationFor (2024), { 7'000'000'000, -512, 0 });
+        }
+
+        beginTest ("Large FIFO addresses keep exact offsets");
+        {
+            constexpr uint64_t base = 4'611'686'018'427'387'904;    // 2^62
+            CombinedOutputCorrespondence c;
+            c.wrote (base, 512);
+            c.wrote (base + 512, 512);
+            c.read (base, 512, 0, stamp);
+            expectTimestamp (c.observationFor (base + 1024), { 5'000'000'000, -1024, 0 });
+        }
+    }
+
+private:
+    void expectTimestamp (const std::optional<AudioIODeviceTimestamp>& actual, const AudioIODeviceTimestamp& expected)
+    {
+        expect (actual.has_value() && isSameTimestamp (*actual, expected), "got " + describe (actual) + ", expected " + describe (expected));
+    }
+
+    void expectAbsent (const std::optional<AudioIODeviceTimestamp>& actual)
+    {
+        expect (! actual.has_value(), "got " + describe (actual) + ", expected absent");
+    }
+};
+
+static CombinedOutputCorrespondenceTests combinedOutputCorrespondenceTests;
+
+//==============================================================================
 /*  Acceptance tests for P021 (ASIO processing-cycle time). The driver time and clock offset are
     fakes; expected times are their sums, worked by hand. Whether the offset is right for a given
     driver is a hardware check (RAILS.md), not a unit test.

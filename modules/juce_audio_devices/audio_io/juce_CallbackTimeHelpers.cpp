@@ -591,4 +591,47 @@ inline std::optional<AudioIODeviceTimestamp> getAlsaTimestamp (bool isCapture,
                                     0 };
 }
 
+//==============================================================================
+/*  The processing-cycle observation of a JACK process callback, from jack_get_cycle_times:
+    currentUsecs, the start of the cycle the callback runs in. It is the server's own prediction of
+    that start (jackd2's DLL output, not a measurement), so the value is native, not computed here.
+*/
+/*  One process callback's clock readings, taken back to back in this order: CLOCK_MONOTONIC,
+    jack_get_time(), CLOCK_MONOTONIC_RAW. jackd2 stamps its cycles with CLOCK_MONOTONIC_RAW, jack1
+    with CLOCK_MONOTONIC; JUCE's clock on Linux is CLOCK_MONOTONIC.
+*/
+struct JackClockReadings
+{
+    int64_t  monotonicNs;
+    uint64_t jackTimeUsecs;
+    int64_t  monotonicRawNs;
+};
+
+/*  JACK's clock is whichever of CLOCK_MONOTONIC and CLOCK_MONOTONIC_RAW jack_get_time() (x 1000) is
+    closer to; a tie is CLOCK_MONOTONIC. The cycle start, currentUsecs x 1000 exactly, moves onto
+    CLOCK_MONOTONIC by adding (monotonicNs - that clock's reading): nothing for CLOCK_MONOTONIC,
+    (monotonicNs - monotonicRawNs) for RAW. Offset 0, flags 0. Each callback is converted from its
+    own readings only; nothing is carried over, so the conversion's error is bounded by the spacing
+    of the three readings plus the two clocks' slew over one cycle, on top of the prediction's own.
+
+    nullopt if jack_get_cycle_times failed (nonzero), or jack_get_time() is more than 1 ms from both
+    clocks.
+*/
+inline std::optional<AudioIODeviceTimestamp> getJackProcessingCycle (int getCycleTimesResult,
+                                                                     uint64_t currentUsecs,
+                                                                     const JackClockReadings& readings) noexcept
+{
+    constexpr int64_t toleranceNs = 1'000'000;
+    const auto jackNs = (int64_t) readings.jackTimeUsecs * 1000;
+    const auto fromMonotonic = jackNs > readings.monotonicNs ? jackNs - readings.monotonicNs : readings.monotonicNs - jackNs;
+    const auto fromRaw       = jackNs > readings.monotonicRawNs ? jackNs - readings.monotonicRawNs : readings.monotonicRawNs - jackNs;
+
+    if (getCycleTimesResult != 0 || (fromMonotonic > toleranceNs && fromRaw > toleranceNs))
+        return {};
+
+    const auto toMonotonic = fromMonotonic <= fromRaw ? (int64_t) 0 : readings.monotonicNs - readings.monotonicRawNs;
+
+    return AudioIODeviceTimestamp { (int64_t) currentUsecs * 1000 + toMonotonic, 0, 0 };
+}
+
 } // namespace juce::CallbackTimeHelpers

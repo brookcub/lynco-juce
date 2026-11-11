@@ -92,6 +92,12 @@ JUCE_DECL_JACK_FUNCTION (int, jack_port_flags, (const jack_port_t* port), (port)
 JUCE_DECL_JACK_FUNCTION (jack_port_t*, jack_port_by_name, (jack_client_t* client, const char* name), (client, name))
 JUCE_DECL_VOID_JACK_FUNCTION (jack_free, (void* ptr), (ptr))
 
+// The two timing functions are resolved when a client is opened (see the constructor), not with
+// JUCE_DECL_JACK_FUNCTION: that resolves on first call, which would be the process thread, and
+// answers 0 ("success") when the symbol is missing. Here a missing symbol stays a null pointer.
+using JackGetCycleTimesFn = int (*) (const jack_client_t*, jack_nframes_t*, jack_time_t*, jack_time_t*, float*);
+using JackGetTimeFn       = jack_time_t (*) ();
+
 #if JUCE_DEBUG
  #define JACK_LOGGING_ENABLED 1
 #endif
@@ -187,6 +193,8 @@ public:
 
         jack_status_t status = {};
         client = juce::jack_client_open (JUCE_JACK_CLIENT_NAME, JackNoStartServer, &status);
+        getCycleTimes = (JackGetCycleTimesFn) juce_loadJackFunction ("jack_get_cycle_times");
+        getTime       = (JackGetTimeFn)       juce_loadJackFunction ("jack_get_time");
 
         if (client == nullptr)
         {
@@ -476,18 +484,62 @@ private:
         if (callback != nullptr)
         {
             if ((numActiveInChans + numActiveOutChans) > 0)
+            {
+                // The current cycle's start, as JACK predicts it, moved onto CLOCK_MONOTONIC from
+                // whichever of that and CLOCK_MONOTONIC_RAW the server's clock is, judged anew
+                // from readings taken here; absent if the call fails, the clock is neither, or
+                // this libjack lacks either function.
+                jack_nframes_t cycleFrames = 0;
+                jack_time_t cycleUsecs = 0, nextUsecs = 0;
+                float periodUsecs = 0;
+
+                std::optional<AudioIODeviceTimestamp> cycle;
+
+                if (getCycleTimes != nullptr && getTime != nullptr)
+                {
+                    const auto cycleResult = getCycleTimes (client, &cycleFrames, &cycleUsecs, &nextUsecs, &periodUsecs);
+                    cycle = CallbackTimeHelpers::getJackProcessingCycle (cycleResult, cycleUsecs, readClocks());
+                }
+
+                AudioIODeviceCallbackContext context;
+                context.processingCycle = cycle.has_value() ? &*cycle : nullptr;
+
                 callback->audioDeviceIOCallbackWithContext (inChans.getData(),
                                                             numActiveInChans,
                                                             outChans,
                                                             numActiveOutChans,
                                                             numSamples,
-                                                            {});
+                                                            context);
+            }
         }
         else
         {
             for (int i = 0; i < numActiveOutChans; ++i)
                 zeromem (outChans[i], static_cast<size_t> (numSamples) * sizeof (float));
         }
+    }
+
+    /*  CLOCK_MONOTONIC, jack_get_time() and CLOCK_MONOTONIC_RAW, back to back in this order.
+        Anywhere but Linux and BSD the readings are far apart, so the cycle time stays absent.
+    */
+    CallbackTimeHelpers::JackClockReadings readClocks() const noexcept
+    {
+        CallbackTimeHelpers::JackClockReadings readings { -1'000'000'000'000, 0, -1'000'000'000'000 };
+
+       #if JUCE_LINUX || JUCE_BSD
+        const auto nanosecondsNow = [] (clockid_t clock)
+        {
+            timespec t;
+            clock_gettime (clock, &t);
+            return (int64_t) t.tv_sec * 1'000'000'000 + (int64_t) t.tv_nsec;
+        };
+
+        readings.monotonicNs    = nanosecondsNow (CLOCK_MONOTONIC);
+        readings.jackTimeUsecs  = getTime();
+        readings.monotonicRawNs = nanosecondsNow (CLOCK_MONOTONIC_RAW);
+       #endif
+
+        return readings;
     }
 
     static int processCallback (jack_nframes_t nframes, void* callbackArgument)
@@ -574,6 +626,8 @@ private:
 
     bool deviceIsOpen = false;
     jack_client_t* client = nullptr;
+    JackGetCycleTimesFn getCycleTimes = nullptr;
+    JackGetTimeFn getTime = nullptr;
     String lastError;
     AudioIODeviceCallback* callback = nullptr;
     CriticalSection callbackLock;

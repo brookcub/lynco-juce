@@ -113,6 +113,9 @@ struct AudioIODeviceTimestamp
     | ALSA                   | snd_pcm_status: the hardware pointer's position   | snd_pcm_status: the hardware pointer's position at | -                         |
     |                        | at its last update, with that update's tstamp     | its last update, with that update's tstamp         |                           |
     |                        | (ring/DMA reference)                              | (ring/DMA reference)                               |                           |
+    | JACK                   | -                                                 | -                                                  | jack_get_cycle_times: the |
+    |                        |                                                   |                                                    | current cycle's start, at |
+    |                        |                                                   |                                                    | offset 0 (prediction)     |
     | all others             | -                                                 | -                                                  | -                         |
 
     An observation never crosses a stop: audioDeviceAboutToStart and audioDeviceStopped

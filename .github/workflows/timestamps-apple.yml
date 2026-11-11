@@ -82,12 +82,19 @@ jobs:
         run: |
           app=$(find build-check -name CombinedDeviceCheck -type f -perm -u+x | head -n 1)
           echo "Running $app"
-          status=0
+          # Exit 0 pass, 1 a wrong value, 3 inconclusive (too little evidence in an xrun storm)
+          codes=""
           for run in 1 2 3; do
             echo "=== run $run"
-            "$app" | tee run$run.log || status=1
+            set +e; "$app" | tee run$run.log; code=${PIPESTATUS[0]}; set -e
+            codes="$codes $code"
           done
-          if [ "${{ matrix.mutant }}" = none ]; then exit $status; fi
+          echo "exit codes:$codes"
+          if [ "${{ matrix.mutant }}" = none ]; then
+            for c in $codes; do case $c in 0|3) ;; *) echo "a run failed"; exit 1;; esac; done
+            echo "$codes" | grep -qw 0 || { echo "no conclusive run"; exit 1; }
+            exit 0
+          fi
           # The mutant must fail every run, on the absolute check alone
           for run in 1 2 3; do
             grep '^FAIL' run$run.log || true

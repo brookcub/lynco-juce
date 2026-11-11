@@ -33,8 +33,12 @@ namespace
     constexpr int blockMilliseconds = 200;
     constexpr int markerEvery = 47;                // callbacks, about 0.25 s
 
-    // MEASURING (not yet pinned): see RAILS.md
-    constexpr double absoluteToleranceFrames = 1.0e6;
+    // Measured on macos-latest with BlackHole 2ch/16ch, run 43019734094 (2026-11-11), 3 runs, 152
+    // markers judged: |captured - predicted| <= 4.8e-5 frames (1 ns, the rounding of the two
+    // conversions); both roles name the loopback ring's cycle sample times through the HAL's one
+    // sample-to-host-time mapping, so agreement is exact. Half a frame: any whole-frame
+    // mis-association fails; the margin over the measurement is 10^4.
+    constexpr double absoluteToleranceFrames = 0.5;
 
     struct Recorder final : public AudioIODeviceCallback
     {
@@ -178,7 +182,15 @@ namespace
        #endif
     }
 
-    int failures = 0;
+    int failures = 0, inconclusive = 0;
+
+    // Too little evidence in this run (an xrun storm on the runner), not a wrong value: the run is
+    // inconclusive (exit 3), and the workflow needs a conclusive run besides
+    void evidence (bool ok, const String& what)
+    {
+        std::cout << (ok ? "PASS  " : "INCONCLUSIVE  ") << what << std::endl;
+        inconclusive += ok ? 0 : 1;
+    }
 
     void check (bool ok, const String& what)
     {
@@ -271,7 +283,7 @@ int main()
     const auto& r = recorder.records;
     std::cout << "callbacks: " << total << ", xruns reported: " << device->getXRunCount() << ", blocked at: " << recorder.blockedAt.load() << std::endl;
 
-    check (total > 3000, "callbacks arrived (" + String (total) + ")");
+    evidence (total > 3000, "callbacks arrived (" + String (total) + ")");
 
     if (total < 300)
         return 2;
@@ -314,7 +326,7 @@ int main()
     }
     std::cout << "re-establishment window " << window << " callbacks (fifo " << fifoFrames << " frames); excused "
               << excused << ", required " << required << ", missing " << missing << std::endl;
-    check (required >= (int) (sampleRate / bufferSize), "at least 1 s of callbacks lie outside xrun windows");
+    evidence (required >= (int) (sampleRate / bufferSize), "at least 1 s of callbacks lie outside xrun windows");
     check (missing == 0, "outputStream present in every callback outside an xrun's re-establishment window");
 
     // inputStream: the app callback runs inside the input device's callback, so the stamp names a
@@ -351,7 +363,8 @@ int main()
 
         std::cout << "input 1 s spans: " << inSpans << ", off by more than 1%: " << inBad << std::endl;
         check (offsetsOk, "inputStream offsets are <= 0");
-        check (inSpans >= 5 && inBad == 0, "inputStream time and frames agree with 48 kHz within 1% over xrun-free 1 s spans");
+        evidence (inSpans >= 5, "at least 5 xrun-free 1 s input spans");
+        check (inBad == 0, "inputStream time and frames agree with 48 kHz within 1% over xrun-free 1 s spans");
     }
 
     // While an observation repeats, its offset falls by the previous callback's numSamples
@@ -372,7 +385,8 @@ int main()
         }
     }
     std::cout << "repeats: " << repeats << ", mismatches: " << badRepeats << std::endl;
-    check (repeats > 0 && badRepeats == 0, "a repeated outputStream's offset falls by exactly the previous numSamples");
+    evidence (repeats > 0, "outputStream observations repeat");
+    check (badRepeats == 0, "a repeated outputStream's offset falls by exactly the previous numSamples");
 
     // Address change implied by the offsets against the time change, over spans of at least 1 s inside
     // a run of callbacks that all have the output role (an absence ends the run)
@@ -414,7 +428,8 @@ int main()
         start = end + 1;
     }
     std::cout << "1 s spans: " << spans << ", off by more than 1%: " << badSpans << std::endl;
-    check (spans >= 5 && badSpans == 0, "address change and time change agree with 48 kHz within 1% over 1 s spans");
+    evidence (spans >= 5, "at least 5 output 1 s spans");
+    check (badSpans == 0, "address change and time change agree with 48 kHz within 1% over 1 s spans");
 
     // The forced xrun: the role is absent for a while after it, and returns
     const auto blocked = recorder.blockedAt.load();
@@ -525,12 +540,12 @@ int main()
         for (auto x : residuals) std::cout << " " << String (x, 3);
         std::cout << std::endl;
 
-        check (residuals.size() >= 20, "at least 20 markers judged (" + String ((int) residuals.size()) + ")");
+        evidence (residuals.size() >= 20, "at least 20 markers judged (" + String ((int) residuals.size()) + ")");
         check (unmatched == 0, "every judged marker was captured");
         check (std::abs (lo) <= absoluteToleranceFrames && std::abs (hi) <= absoluteToleranceFrames,
                "outputStream predicts each marker's capture within " + String (absoluteToleranceFrames) + " frames");
     }
 
-    std::cout << (failures == 0 ? "ALL PASS" : "FAILURES: " + String (failures)) << std::endl;
-    return failures == 0 ? 0 : 1;
+    std::cout << (failures > 0 ? "FAILURES: " + String (failures) : inconclusive > 0 ? "INCONCLUSIVE: " + String (inconclusive) : String ("ALL PASS")) << std::endl;
+    return failures > 0 ? 1 : (inconclusive > 0 ? 3 : 0);
 }

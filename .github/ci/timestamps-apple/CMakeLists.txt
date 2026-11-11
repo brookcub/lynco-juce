@@ -13,6 +13,6 @@ else()
     # Opens two virtual HAL devices as one combined CoreAudio device and checks the timestamps
     juce_add_console_app (CombinedDeviceCheck PRODUCT_NAME "CombinedDeviceCheck")
     target_sources (CombinedDeviceCheck PRIVATE Main.cpp)
-    target_compile_definitions (CombinedDeviceCheck PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
+    target_compile_definitions (CombinedDeviceCheck PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_MODAL_LOOPS_PERMITTED=1)
     target_link_libraries (CombinedDeviceCheck PRIVATE juce::juce_audio_utils juce::juce_recommended_config_flags)
 endif()

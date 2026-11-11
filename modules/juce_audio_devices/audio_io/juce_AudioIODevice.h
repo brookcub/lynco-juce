@@ -45,9 +45,10 @@ class AudioIODevice;
     timeNs is in nanoseconds on the clock and origin of Time::getHighResolutionTicks()
     (QueryPerformanceCounter on Windows, mach_absolute_time on Apple, CLOCK_MONOTONIC on
     Android and Linux), converted from the native value by an exact unit conversion (for
-    ASIO, plus a clock-origin offset measured once when the device starts). It is what the
-    OS or driver reported, with no latency, smoothing or rate correction. Zero is a valid
-    time.
+    ASIO, plus a clock-origin offset measured once when the device starts; for JACK on a
+    CLOCK_MONOTONIC_RAW server, plus CLOCK_MONOTONIC - CLOCK_MONOTONIC_RAW as read in the
+    same callback). It is what the OS or driver reported, with no latency, smoothing or rate
+    correction. Zero is a valid time.
 
     sampleOffset is the timestamped sample's position minus the position of the first
     sample of the callback's buffer, in sample frames (not interleaved values): negative
@@ -104,7 +105,8 @@ struct AudioIODeviceTimestamp
     | ALSA                   | snd_pcm_htimestamp: the hardware pointer's        | snd_pcm_htimestamp: the hardware pointer's         | -                         |
     |                        | position at its last update (ring/DMA reference)  | position at its last update (ring/DMA reference)   |                           |
     | JACK                   | -                                                 | -                                                  | jack_get_cycle_times: the |
-    |                        |                                                   |                                                    | current cycle, offset 0   |
+    |                        |                                                   |                                                    | current cycle's start, at |
+    |                        |                                                   |                                                    | offset 0 (prediction)     |
     | all others             | -                                                 | -                                                  | -                         |
 
     An observation never crosses a stop: audioDeviceAboutToStart and audioDeviceStopped

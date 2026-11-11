@@ -671,8 +671,12 @@ private:
 static AlsaTimestampTests alsaTimestampTests;
 
 //==============================================================================
-/*  Acceptance tests for P023 (JACK processing-cycle time). The cycle times are fakes; expected
-    times are microseconds x 1000, worked by hand.
+/*  Acceptance tests for P023 (JACK processing-cycle time), SPEC "JACK clock: ruling 8 replaced".
+    Each call passes one callback's readings { CLOCK_MONOTONIC ns, jack_get_time() us,
+    CLOCK_MONOTONIC_RAW ns }. Readings and cycle times are fakes; expected times are hand-worked
+    integers, checked with Python fractions on 2026-11-11 (rails author's oracle run). The
+    MONOTONIC - RAW differences used, 62.6 ms and 450.8 ms, are of the size measured on WSL2 and on
+    the GitHub Ubuntu runners (2026-11-11).
 */
 class JackProcessingCycleTests final : public UnitTest
 {
@@ -681,21 +685,81 @@ public:
 
     void runTest() override
     {
-        beginTest ("The current cycle's start in ns, exactly, at offset 0, from zero to large values");
+        beginTest ("A CLOCK_MONOTONIC_RAW server: the cycle time moves onto CLOCK_MONOTONIC by the current difference");
         {
-            expectTimestamp (getJackProcessingCycle (0, 1'234'567, true), { 1'234'567'000, 0, 0 });
-            expectTimestamp (getJackProcessingCycle (0, 0, true), { 0, 0, 0 });
+            // jack_get_time 500 ns from RAW, 62.6 ms from MONOTONIC: 29'995'000'000 + (30'062'600'250 - 30'000'000'500)
+            expectTimestamp (cycle (0, 29'995'000, 30'062'600'250, 30'000'000, 30'000'000'500), { 30'057'599'750, 0, 0 });
+
+            // 1 us from RAW, 450.8 ms from MONOTONIC: 1'199'994'667'000 + 450'777'583
+            expectTimestamp (cycle (0, 1'199'994'667, 1'200'450'777'583, 1'199'999'999, 1'200'000'000'000), { 1'200'445'444'583, 0, 0 });
+        }
+
+        beginTest ("A CLOCK_MONOTONIC server: the cycle time is kept, x 1000 exactly, from zero to large values");
+        {
+            // jack_get_time 250 ns from MONOTONIC, 60 ms from RAW
+            expectTimestamp (cycle (0, 6'994'667, 7'000'000'250, 7'000'000, 6'940'000'400), { 6'994'667'000, 0, 0 });
+            expectTimestamp (cycle (0, 0, 7'000'000'250, 7'000'000, 6'940'000'400), { 0, 0, 0 });
 
             // 2^53 + 1 us (285 years) is still exact
-            expectTimestamp (getJackProcessingCycle (0, 9'007'199'254'740'993, true), { 9'007'199'254'740'993'000, 0, 0 });
+            expectTimestamp (cycle (0, 9'007'199'254'740'993, 7'000'000'250, 7'000'000, 6'940'000'400), { 9'007'199'254'740'993'000, 0, 0 });
         }
 
-        beginTest ("A failed query, or a clock not known to be CLOCK_MONOTONIC, gives nothing");
+        beginTest ("Both clocks equal: the cycle time is kept");
         {
-            expectTimestamp (getJackProcessingCycle (0, 1'000, true), { 1'000'000, 0, 0 });
-            expectAbsent (getJackProcessingCycle (-1, 1'000, true));
-            expectAbsent (getJackProcessingCycle (0, 1'000, false));
+            expectTimestamp (cycle (0, 499'994'667, 500'000'000'123, 500'000'000, 500'000'000'123), { 499'994'667'000, 0, 0 });
         }
+
+        beginTest ("jack_get_time exactly between the two clocks: CLOCK_MONOTONIC, nothing added");
+        {
+            // 500 us from each; RAW would give 2'995'000'000 - 1'000'000
+            expectTimestamp (cycle (0, 2'995'000, 3'000'000'000, 3'000'500, 3'001'000'000), { 2'995'000'000, 0, 0 });
+        }
+
+        beginTest ("Neither clock within 1 ms, or a failed query: absent");
+        {
+            // 50 ms from MONOTONIC, 150 ms from RAW
+            expectAbsent (cycle (0, 10'045'000, 10'000'000'000, 10'050'000, 9'900'000'000));
+
+            // exactly 1 ms is within, 1 ms + 1 ns is not: after and before MONOTONIC, then RAW
+            expectTimestamp (cycle (0, 2'000'000, 2'000'000'000, 2'001'000, 1'000'000'000), { 2'000'000'000, 0, 0 });
+            expectAbsent    (cycle (0, 2'000'000, 1'999'999'999, 2'001'000, 1'000'000'000));
+            expectTimestamp (cycle (0, 2'000'000, 2'000'000'000, 1'999'000, 1'000'000'000), { 2'000'000'000, 0, 0 });
+            expectAbsent    (cycle (0, 2'000'000, 2'000'000'001, 1'999'000, 1'000'000'000));
+            expectTimestamp (cycle (0, 2'000'000, 3'000'000'000, 2'001'000, 2'000'000'000), { 3'000'000'000, 0, 0 });
+            expectAbsent    (cycle (0, 2'000'000, 3'000'000'000, 2'001'000, 1'999'999'999));
+
+            // a nonzero jack_get_cycle_times result, with readings that are otherwise present
+            expectAbsent (cycle (-1, 29'995'000, 30'062'600'250, 30'000'000, 30'000'000'500));
+            expectAbsent (cycle (1, 6'994'667, 7'000'000'250, 7'000'000, 6'940'000'400));
+        }
+
+        beginTest ("The conversion: microseconds x 1000, plus the readings' MONOTONIC - RAW difference with its sign");
+        {
+            // RAW 250 ms ahead of MONOTONIC: 100'244'667'000 - 250'000'000
+            expectTimestamp (cycle (0, 100'244'667, 100'000'000'000, 100'250'000, 100'250'000'000), { 99'994'667'000, 0, 0 });
+
+            // the difference to the ns, not to the microsecond: 4'999'999'000 + 1'234'567'891
+            expectTimestamp (cycle (0, 4'999'999, 6'234'567'891, 5'000'000, 5'000'000'000), { 6'234'566'891, 0, 0 });
+
+            // near 2^63 ns, beyond double precision: 9'007'199'254'735'660'000 + 450'777'583
+            expectTimestamp (cycle (0, 9'007'199'254'735'660, 9'007'199'255'191'770'583, 9'007'199'254'740'993, 9'007'199'254'740'993'000),
+                             { 9'007'199'255'186'437'583, 0, 0 });
+        }
+
+        beginTest ("Each callback is converted from its own readings: nothing is carried between callbacks");
+        {
+            expectTimestamp (cycle (0, 29'995'000, 30'062'600'250, 30'000'000, 30'000'000'500), { 30'057'599'750, 0, 0 });
+            expectTimestamp (cycle (0, 30'000'000, 30'068'000'000, 30'005'333, 30'005'333'600), { 30'062'666'400, 0, 0 });   // a new difference
+            expectAbsent    (cycle (0, 30'015'000, 30'073'000'000, 30'020'000, 30'010'666'000));                            // neither clock
+            expectTimestamp (cycle (0, 30'072'667, 30'078'000'000, 30'078'000, 30'015'000'000), { 30'072'667'000, 0, 0 });   // now MONOTONIC
+            expectTimestamp (cycle (0, 29'995'000, 30'062'600'250, 30'000'000, 30'000'000'500), { 30'057'599'750, 0, 0 });   // the first again
+        }
+    }
+
+    static std::optional<AudioIODeviceTimestamp> cycle (int result, uint64_t currentUsecs,
+                                                        int64_t monotonicNs, uint64_t jackTimeUsecs, int64_t monotonicRawNs)
+    {
+        return getJackProcessingCycle (result, currentUsecs, JackClockReadings { monotonicNs, jackTimeUsecs, monotonicRawNs });
     }
 
 private:

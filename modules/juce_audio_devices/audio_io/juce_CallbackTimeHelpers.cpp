@@ -465,4 +465,33 @@ inline std::optional<AudioIODeviceTimestamp> getJackProcessingCycle (int getCycl
     return AudioIODeviceTimestamp { (int64_t) currentUsecs * 1000, 0, 0 };
 }
 
+/*  One process callback's clock readings, taken back to back in this order: CLOCK_MONOTONIC,
+    jack_get_time(), CLOCK_MONOTONIC_RAW.
+*/
+struct JackClockReadings
+{
+    int64_t  monotonicNs;
+    uint64_t jackTimeUsecs;
+    int64_t  monotonicRawNs;
+};
+
+/*  SPEC "JACK clock: ruling 8 replaced". JACK's clock is whichever of CLOCK_MONOTONIC and
+    CLOCK_MONOTONIC_RAW jack_get_time() (x 1000) is closer to; a tie is CLOCK_MONOTONIC. The cycle
+    start, currentUsecs x 1000 exactly, moves onto CLOCK_MONOTONIC by adding (monotonicNs - that
+    clock's reading): nothing for CLOCK_MONOTONIC, (monotonicNs - monotonicRawNs) for RAW. Offset 0,
+    flags 0. Each callback is converted from its own readings only; nothing is carried over.
+
+    nullopt if jack_get_cycle_times failed (nonzero), or jack_get_time() is more than 1 ms from both
+    clocks.
+
+    Supersedes the overload above, which P023's builder deletes with the backend's activation check.
+*/
+inline std::optional<AudioIODeviceTimestamp> getJackProcessingCycle (int getCycleTimesResult,
+                                                                     uint64_t currentUsecs,
+                                                                     const JackClockReadings& readings) noexcept
+{
+    ignoreUnused (getCycleTimesResult, currentUsecs, readings);
+    return {};    // P023 implements
+}
+
 } // namespace juce::CallbackTimeHelpers

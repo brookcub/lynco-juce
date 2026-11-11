@@ -95,6 +95,7 @@ struct AudioIODeviceTimestamp
     | WASAPI                 | GetBuffer: the capture time of the first frame of | IAudioClock::GetPosition: the frame playing at the | -                         |
     |                        | the packet holding the callback's first real      | reported time (observation)                        |                           |
     |                        | sample (observation)                              |                                                    |                           |
+    | Oboe (AAudio, API 30+) | getTimestamp: a frame entering the pipeline       | getTimestamp: a frame leaving the pipeline         | -                         |
     | all others             | -                                                 | -                                                  | -                         |
 
     An observation never crosses a stop: audioDeviceAboutToStart and audioDeviceStopped

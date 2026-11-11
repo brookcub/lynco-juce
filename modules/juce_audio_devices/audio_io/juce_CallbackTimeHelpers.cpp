@@ -107,4 +107,46 @@ inline AudioIODeviceTimestamp forChunkAt (const AudioIODeviceTimestamp& timestam
     return result;
 }
 
+//==============================================================================
+/** A timestamp as Oboe's getTimestamp reports it: frame framePosition of the stream passed the
+    device at timeNs (CLOCK_MONOTONIC).
+*/
+struct StreamTimestamp
+{
+    int64_t framePosition = 0;
+    int64_t timeNs = 0;
+};
+
+/*  The input observation of an Oboe callback whose input was just read. framesReadAfterRead is the
+    stream's getFramesRead() after the read, and framesJustRead the frames it delivered, which fill
+    the start of the buffer (a short read is padded at the end). The offset is the stream
+    timestamp's frame minus the buffer's first frame, and the time is the stream's, unchanged.
+
+    nullopt if the stream gave no timestamp or no frame was read.
+*/
+inline std::optional<AudioIODeviceTimestamp> getOboeInputTimestamp (const std::optional<StreamTimestamp>& stream,
+                                                                    int64_t framesReadAfterRead,
+                                                                    int64_t framesJustRead) noexcept
+{
+    if (! stream.has_value() || framesJustRead <= 0)
+        return {};
+
+    return AudioIODeviceTimestamp { stream->timeNs, stream->framePosition - (framesReadAfterRead - framesJustRead), 0 };
+}
+
+/*  The output observation of an Oboe callback: framesWrittenBeforeCallback is the stream's
+    getFramesWritten() at the start of the callback, the frame index of the buffer's first frame.
+    The offset is the stream timestamp's frame minus that index, and the time is the stream's.
+
+    nullopt if the stream gave no timestamp.
+*/
+inline std::optional<AudioIODeviceTimestamp> getOboeOutputTimestamp (const std::optional<StreamTimestamp>& stream,
+                                                                     int64_t framesWrittenBeforeCallback) noexcept
+{
+    if (! stream.has_value())
+        return {};
+
+    return AudioIODeviceTimestamp { stream->timeNs, stream->framePosition - framesWrittenBeforeCallback, 0 };
+}
+
 } // namespace juce::CallbackTimeHelpers

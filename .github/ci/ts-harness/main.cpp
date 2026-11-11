@@ -18,7 +18,7 @@ using namespace juce;
 struct Rec
 {
     int64_t nowNs;
-    int numSamples;
+    int numSamples, xruns;
     bool hostNull, inP, outP, cycP;
     AudioIODeviceTimestamp in, out, cyc;
 };
@@ -34,6 +34,7 @@ struct Recorder final : AudioIODeviceCallback
 {
     std::vector<Rec> recs;
     std::atomic<bool> recording { false };
+    AudioIODevice* device = nullptr;    // set before recording starts
 
     Recorder() { recs.reserve (400000); }
 
@@ -52,6 +53,7 @@ struct Recorder final : AudioIODeviceCallback
         Rec r {};
         r.nowNs = clockNs (CLOCK_MONOTONIC);
         r.numSamples = n;
+        r.xruns = device != nullptr ? device->getXRunCount() : 0;
         r.hostNull = c.hostTimeNs == nullptr;
         if ((r.inP = c.inputStream != nullptr))       r.in = *c.inputStream;
         if ((r.outP = c.outputStream != nullptr))     r.out = *c.outputStream;
@@ -183,6 +185,7 @@ int main (int argc, char** argv)
     const int64_t outRing = alsaPresent && argc > 6 ? ringFrames (argv[6]) : 0;
     const int64_t inRing  = alsaPresent && argc > 7 ? ringFrames (argv[7]) : 0;
 
+    rec.device = dev;
     rec.recording = true;
     Thread::sleep ((int) (seconds * 1000));
     rec.recording = false;
@@ -201,12 +204,15 @@ int main (int argc, char** argv)
     for (auto& x : r) { hostNonNull += ! x.hostNull; inP += x.inP; outP += x.outP; cycP += x.cycP; }
     const double N = (double) r.size();
     std::printf ("present: in %.1f%% out %.1f%% cycle %.1f%%\n", 100 * inP / N, 100 * outP / N, 100 * cycP / N);
+    std::printf ("xrun count changes at callbacks:");
+    for (size_t i = 1; i < r.size(); ++i) if (r[i].xruns != r[i - 1].xruns) std::printf (" %zu", i);
+    std::printf ("\n");
     check (hostNonNull == 0, "hostTimeNs always null");
 
     // Per-1 s span: the change in (time, offset+frames delivered) must agree with 48 kHz within 1 %.
     auto spans = [&] (auto present, auto get, bool useOffset, const char* name)
     {
-        int tested = 0, bad = 0;
+        int tested = 0, bad = 0, excused = 0;
         size_t a = 0;
         while (a < r.size())
         {
@@ -217,6 +223,9 @@ int main (int argc, char** argv)
             if (b >= r.size()) break;
             while (b < r.size() && ! present (r[b])) { frames += r[b - 1].numSamples; ++b; }
             if (b >= r.size()) break;
+            // A span with an xrun in it is not judged: the server skips cycles, so time runs on
+            // without frames (seen on WSL under load, 2026-11-11: one jackd XRun, one span at 47490 Hz)
+            if (r[b].xruns != r[a].xruns) { ++excused; a = b; continue; }
             const auto ta = get (r[a]), tb = get (r[b]);
             const double dt = (double) (tb.timeNs - ta.timeNs) * 1e-9;
             // native frames elapsed = frames delivered between the buffers + change of offset
@@ -229,7 +238,7 @@ int main (int argc, char** argv)
             }
             a = b;
         }
-        check (tested > 0 && bad == 0, String (name) + ": time/offset spans agree with 48 kHz within 1% (" + String (tested) + " spans, " + String (bad) + " bad)");
+        check (tested > 0 && bad == 0, String (name) + ": time/offset spans agree with 48 kHz within 1% (" + String (tested) + " spans, " + String (bad) + " bad, " + String (excused) + " with an xrun not judged)");
     };
 
     if (! jack && expectation == "absent")
@@ -279,7 +288,7 @@ int main (int argc, char** argv)
                 maxLead = std::max (maxLead, lead);
                 const bool ok = lead <= 1'000'000 && lead >= -(2 * period + 1'000'000);
                 inWindow = inWindow && ok;
-                if (! ok && outside++ < 3) std::printf ("   outside the window at %zu: lead %lld ns\n", i, (long long) lead);
+                if (! ok && outside++ < 3) std::printf ("   outside the window at %zu: lead %lld ns (xruns %d)\n", i, (long long) lead, r[i].xruns);
 
                 if (i > 0 && r[i - 1].cycP)
                 {
@@ -291,7 +300,7 @@ int main (int argc, char** argv)
                     const bool repeat = std::abs (d) < 1'000'000 && r[i].nowNs - r[i - 1].nowNs < 1'000'000;
                     increasing = increasing && (d > 0 || repeat);
                     repeats += repeat;
-                    if (d <= 0 && ! repeat) std::printf ("   non-increasing at %zu: d=%lld ns, now-delta %lld\n", i, (long long) d, (long long) (r[i].nowNs - r[i - 1].nowNs));
+                    if (d <= 0 && ! repeat) std::printf ("   non-increasing at %zu: d=%lld ns, now-delta %lld (xruns %d)\n", i, (long long) d, (long long) (r[i].nowNs - r[i - 1].nowNs), r[i].xruns);
                 }
             }
             std::printf ("cycle time - callback entry: min %lld ns, max %lld ns\n", (long long) minLead, (long long) maxLead);

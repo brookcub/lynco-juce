@@ -298,17 +298,24 @@ struct AlsaPositionReading
     nullopt if there is no reading, if the PCM's timestamps are not on CLOCK_MONOTONIC (JUCE's clock
     on Linux), or if availFrames is outside [0, ringBufferFrames] (an overrun or underrun, where the
     count no longer describes the ring).
-
-    Stub: the patch that implements it is P022.
 */
-inline std::optional<AudioIODeviceTimestamp> getAlsaTimestamp ([[maybe_unused]] bool isCapture,
-                                                               [[maybe_unused]] const std::optional<AlsaPositionReading>& reading,
-                                                               [[maybe_unused]] bool timestampsAreMonotonic,
-                                                               [[maybe_unused]] int64_t applicationFramesAtReading,
-                                                               [[maybe_unused]] int64_t bufferStartFrame,
-                                                               [[maybe_unused]] int64_t ringBufferFrames) noexcept
+inline std::optional<AudioIODeviceTimestamp> getAlsaTimestamp (bool isCapture,
+                                                               const std::optional<AlsaPositionReading>& reading,
+                                                               bool timestampsAreMonotonic,
+                                                               int64_t applicationFramesAtReading,
+                                                               int64_t bufferStartFrame,
+                                                               int64_t ringBufferFrames) noexcept
 {
-    return {};
+    if (! reading.has_value() || ! timestampsAreMonotonic
+        || reading->availFrames < 0 || reading->availFrames > ringBufferFrames)
+        return {};
+
+    const auto hardwarePointer = isCapture ? applicationFramesAtReading + reading->availFrames
+                                           : applicationFramesAtReading - (ringBufferFrames - reading->availFrames);
+
+    return AudioIODeviceTimestamp { reading->seconds * 1'000'000'000 + reading->nanoseconds,
+                                    hardwarePointer - bufferStartFrame,
+                                    0 };
 }
 
 //==============================================================================

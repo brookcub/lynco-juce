@@ -96,7 +96,6 @@ public:
     void audioDeviceAboutToStart (AudioIODevice* device) override
     {
         maximumSize = device->getCurrentBufferSizeSamples();
-        sampleRate = device->getCurrentSampleRate();
         storedInputChannels .resize ((size_t) device->getActiveInputChannels() .countNumberOfSetBits());
         storedOutputChannels.resize ((size_t) device->getActiveOutputChannels().countNumberOfSetBits());
 
@@ -119,11 +118,23 @@ public:
         {
             const auto blockLength = jmin (maximumSize, numSamples - position);
 
-            const auto offsetNs = sampleRate > 0.0 ? (uint64_t) std::llround ((double) position * 1.0e9 / sampleRate)
-                                                   : (uint64_t) 0;
-            uint64_t hostTime = 0, inputHostTime = 0;
-            const AudioIODeviceCallbackContext blockContext { advance (context.hostTimeNs, offsetNs, hostTime),
-                                                              advance (context.inputHostTimeNs, offsetNs, inputHostTime) };
+            // hostTimeNs is stock JUCE's: every block gets the device's own context value. The
+            // native timestamps keep their time and flags, and only the offset changes, because
+            // the block starts position samples after the callback's buffer.
+            const auto shifted = [position] (const AudioIODeviceTimestamp* source, AudioIODeviceTimestamp& storage) -> const AudioIODeviceTimestamp*
+            {
+                if (source == nullptr)
+                    return source;
+
+                storage = CallbackTimeHelpers::forChunkAt (*source, position);
+                return &storage;
+            };
+
+            AudioIODeviceTimestamp inputStorage, outputStorage, cycleStorage;
+            AudioIODeviceCallbackContext blockContext = context;
+            blockContext.inputStream = shifted (context.inputStream, inputStorage);
+            blockContext.outputStream = shifted (context.outputStream, outputStorage);
+            blockContext.processingCycle = shifted (context.processingCycle, cycleStorage);
 
             const auto addOffset = [position] (auto ptr) { return ptr + position; };
             std::transform (inputChannelData,  inputChannelData  + numInputChannels,  storedInputChannels .begin(), addOffset);
@@ -151,20 +162,10 @@ public:
     }
 
 private:
-    static const uint64_t* advance (const uint64_t* time, uint64_t offsetNs, uint64_t& storage)
-    {
-        if (time == nullptr || offsetNs == 0)
-            return time;
-
-        storage = *time + offsetNs;
-        return &storage;
-    }
-
     std::vector<const float*> storedInputChannels;
     std::vector<float*> storedOutputChannels;
     AudioIODeviceCallback& inner;
     int maximumSize = 0;
-    double sampleRate = 0.0;
 };
 
 //==============================================================================

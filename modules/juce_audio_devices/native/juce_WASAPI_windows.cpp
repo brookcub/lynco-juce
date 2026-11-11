@@ -1083,6 +1083,13 @@ inline std::optional<AudioIODeviceTimestamp> getRenderTimestamp (HRESULT getPosi
     presentation (measured: 8-16 ms off), so the output role stays absent until the stream
     restarts. The input role does not use this.
 
+    How the backend feeds it (SPEC "Rulings on the prosecution review", F1 and F3): the class
+    does not know the share mode or which write is the first, so nothing may be filtered on
+    the way in. Every successful GetCurrentPadding taken before a write goes to
+    paddingBeforeWrite, in shared and exclusive mode alike, the first application write after
+    start()'s silence included (an engine that ran dry before the first block is an underrun
+    too); a padding that cannot be read before a write is a lose().
+
     Implementers may add private members; the public interface is fixed.
 */
 class RenderStreamCorrespondence

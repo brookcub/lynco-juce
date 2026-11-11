@@ -274,6 +274,31 @@ public:
             expect (! stream.callbackStart().has_value(), "the role must stay absent until the stream restarts");
         }
 
+        // F1/F3 (SPEC "Rulings on the prosecution review"): the start-up dry. On this host every run
+        // finds the engine empty at the first application write, after start()'s silence
+        // (REVIEW.md F1: hw-windows/data-r2/dbgw_cb.csv, the role absent in all 399 callbacks once
+        // that write is latched). The class has no share mode: exclusive mode is fed the same way.
+        beginTest ("Render bookkeeping: the first application write finding the engine dry after start()'s silence is an underrun");
+        {
+            RenderStreamCorrespondence stream;
+            stream.reset();
+            stream.paddingBeforeWrite (0);    // start(): nothing released yet, not an underrun
+            stream.released (1056);
+            expect (stream.callbackStart() == std::optional<int64_t> (1056));
+
+            stream.paddingBeforeWrite (0);    // the first application write: the silence has already played out
+            expect (! stream.callbackStart().has_value(), "a start-up dry must make the callback position unknown");
+            expectAbsent (getRenderTimestamp (S_OK, 1056, 2'000'000, 48'000, 48000, stream.callbackStart()));
+
+            for (int i = 0; i < 100; ++i)
+            {
+                stream.released (480);
+                stream.paddingBeforeWrite (576);
+            }
+
+            expect (! stream.callbackStart().has_value(), "the role must stay absent until the stream restarts");
+        }
+
         beginTest ("Render bookkeeping: a restart re-establishes the correspondence from zero");
         {
             RenderStreamCorrespondence stream;

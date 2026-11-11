@@ -495,20 +495,19 @@ private:
 
     void process (const float* const* inputChannelData, int numInputChannels,
                   float* const* outputChannelData, int numOutputChannels, int32_t numFrames,
-                  std::optional<uint64_t> outputTime, std::optional<uint64_t> inputTime)
+                  const std::optional<AudioIODeviceTimestamp>& outputTimestamp,
+                  const std::optional<AudioIODeviceTimestamp>& inputTimestamp)
     {
         if (auto* cb = callback.get())
         {
-            // As the callback context defines them: with no outputs the callback's time is the input's.
-            const auto hostTime = numOutputChannels > 0 ? outputTime : inputTime;
-            const auto pointerTo = [] (const std::optional<uint64_t>& time) { return time.has_value() ? &*time : nullptr; };
+            const auto pointerTo = [] (const std::optional<AudioIODeviceTimestamp>& t) { return t.has_value() ? &*t : nullptr; };
 
             cb->audioDeviceIOCallbackWithContext (inputChannelData,
                                                   numInputChannels,
                                                   outputChannelData,
                                                   numOutputChannels,
                                                   numFrames,
-                                                  { pointerTo (hostTime), pointerTo (inputTime) });
+                                                  { nullptr, pointerTo (inputTimestamp), pointerTo (outputTimestamp), nullptr });
         }
         else
         {
@@ -1032,7 +1031,7 @@ private:
                 // only output stream should be the master stream receiving callbacks
                 jassert (stream->getDirection() == oboe::Direction::Output && stream == outputStream->getNativeStream().get());
 
-                std::optional<uint64_t> inputTime, outputTime;
+                std::optional<AudioIODeviceTimestamp> inputTime, outputTime;
 
                 // Never resize scratch buffers on the audio thread if a backend exceeds its advertised capacity.
                 if (numFrames > bufferCapacity)
@@ -1063,11 +1062,9 @@ private:
 
                     // The frames just read end at getFramesRead(), which is after the read.
                     const auto inputTimestamp = readTimestamp (*nativeInputStream);
-                    inputTime = getInputBlockTimeNs (areDeviceTimesSupported,
-                                                     [&] (int64_t& position, int64_t& time) { return inputTimestamp.get (position, time); },
-                                                     [&] { return nativeInputStream->getFramesRead(); },
-                                                     (int64_t) framesRead,
-                                                     nativeInputStream->getSampleRate());
+                    inputTime = CallbackTimeHelpers::getOboeInputTimestamp (inputTimestamp.asStreamTimestamp(),
+                                                                            nativeInputStream->getFramesRead(),
+                                                                            framesRead);
 
                     if (isInputLatencyDetectionSupported)
                         inputLatency = getLatencyFor (*inputStream, inputTimestamp);
@@ -1088,10 +1085,8 @@ private:
 
                 if (numOutputChannels > 0)
                 {
-                    outputTime = getStreamFrameTimeNs (areDeviceTimesSupported,
-                                                       [&] (int64_t& position, int64_t& time) { return outputTimestamp.get (position, time); },
-                                                       [&] { return stream->getFramesWritten(); },
-                                                       stream->getSampleRate());
+                    outputTime = CallbackTimeHelpers::getOboeOutputTimestamp (outputTimestamp.asStreamTimestamp(),
+                                                                              stream->getFramesWritten());
                 }
 
                 // Process
@@ -1130,6 +1125,14 @@ private:
                 position = framePosition;
                 time = timeNs;
                 return ok;
+            }
+
+            std::optional<CallbackTimeHelpers::StreamTimestamp> asStreamTimestamp() const
+            {
+                if (ok)
+                    return CallbackTimeHelpers::StreamTimestamp { framePosition, timeNs };
+
+                return {};
             }
         };
 

@@ -126,14 +126,15 @@ struct StreamTimestamp
     timestamp's frame minus the buffer's first frame, and the time is the stream's, unchanged.
 
     nullopt if the stream gave no timestamp or no frame was read.
-
-    Stub: the patch that implements it is P013.1.
 */
-inline std::optional<AudioIODeviceTimestamp> getOboeInputTimestamp ([[maybe_unused]] const std::optional<StreamTimestamp>& stream,
-                                                                    [[maybe_unused]] int64_t framesReadAfterRead,
-                                                                    [[maybe_unused]] int64_t framesJustRead) noexcept
+inline std::optional<AudioIODeviceTimestamp> getOboeInputTimestamp (const std::optional<StreamTimestamp>& stream,
+                                                                    int64_t framesReadAfterRead,
+                                                                    int64_t framesJustRead) noexcept
 {
-    return {};
+    if (! stream.has_value() || framesJustRead <= 0)
+        return {};
+
+    return AudioIODeviceTimestamp { stream->timeNs, stream->framePosition - (framesReadAfterRead - framesJustRead), 0 };
 }
 
 /*  The output observation of an Oboe callback: framesWrittenBeforeCallback is the stream's
@@ -141,13 +142,14 @@ inline std::optional<AudioIODeviceTimestamp> getOboeInputTimestamp ([[maybe_unus
     The offset is the stream timestamp's frame minus that index, and the time is the stream's.
 
     nullopt if the stream gave no timestamp.
-
-    Stub: the patch that implements it is P013.1.
 */
-inline std::optional<AudioIODeviceTimestamp> getOboeOutputTimestamp ([[maybe_unused]] const std::optional<StreamTimestamp>& stream,
-                                                                     [[maybe_unused]] int64_t framesWrittenBeforeCallback) noexcept
+inline std::optional<AudioIODeviceTimestamp> getOboeOutputTimestamp (const std::optional<StreamTimestamp>& stream,
+                                                                     int64_t framesWrittenBeforeCallback) noexcept
 {
-    return {};
+    if (! stream.has_value())
+        return {};
+
+    return AudioIODeviceTimestamp { stream->timeNs, stream->framePosition - framesWrittenBeforeCallback, 0 };
 }
 
 //==============================================================================

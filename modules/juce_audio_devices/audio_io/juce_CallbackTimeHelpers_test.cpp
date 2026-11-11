@@ -210,4 +210,75 @@ private:
 
 static CallbackTimestampAlignmentTests callbackTimestampAlignmentTests;
 
+//==============================================================================
+/*  Acceptance tests for P013.1 (Oboe device timestamps, streams at the application's rate). The
+    stream timestamp is a fake; the expected offset is its frame minus the buffer's first frame,
+    worked by hand, and the expected time is the fake's own.
+*/
+class OboeStreamTimestampTests final : public UnitTest
+{
+public:
+    OboeStreamTimestampTests() : UnitTest ("Oboe stream timestamps", UnitTestCategories::audio) {}
+
+    void runTest() override
+    {
+        beginTest ("Input: the offset is the stream timestamp's frame minus the buffer's first frame, and the time is the stream's");
+        {
+            // 1920 frames read, 480 of them just now: the buffer starts at frame 1440
+            expectTimestamp (getOboeInputTimestamp (StreamTimestamp { 1440, 7'000'000'000 }, 1920, 480), { 7'000'000'000, 0, 0 });
+            expectTimestamp (getOboeInputTimestamp (StreamTimestamp { 1920, 7'000'000'000 }, 1920, 480), { 7'000'000'000, 480, 0 });
+            expectTimestamp (getOboeInputTimestamp (StreamTimestamp { 960,  7'000'000'000 }, 1920, 480), { 7'000'000'000, -480, 0 });
+        }
+
+        beginTest ("Input: a short read starts the buffer at its own first frame");
+        {
+            // 96 of 480 frames read: frames 1824 to 1919 start the buffer, and padding follows them
+            expectTimestamp (getOboeInputTimestamp (StreamTimestamp { 1920, 7'000'000'000 }, 1920, 96), { 7'000'000'000, 96, 0 });
+            expectTimestamp (getOboeInputTimestamp (StreamTimestamp { 1919, 7'000'000'000 }, 1920, 1), { 7'000'000'000, 0, 0 });
+        }
+
+        beginTest ("Input: nothing read, or no stream timestamp, gives nothing");
+        {
+            expectTimestamp (getOboeInputTimestamp (StreamTimestamp { 1920, 7'000'000'000 }, 1920, 480), { 7'000'000'000, 480, 0 });
+            expectAbsent (getOboeInputTimestamp (StreamTimestamp { 1920, 7'000'000'000 }, 1920, 0));
+            expectAbsent (getOboeInputTimestamp (StreamTimestamp { 1920, 7'000'000'000 }, 1920, -1));
+            expectAbsent (getOboeInputTimestamp (std::nullopt, 1920, 480));
+        }
+
+        beginTest ("Output: the offset is the stream timestamp's frame minus the frames written before the callback");
+        {
+            expectTimestamp (getOboeOutputTimestamp (StreamTimestamp { 48'000, 5'000'000'000 }, 48'480), { 5'000'000'000, -480, 0 });
+            expectTimestamp (getOboeOutputTimestamp (StreamTimestamp { 48'960, 5'000'000'000 }, 48'480), { 5'000'000'000, 480, 0 });
+            expectAbsent (getOboeOutputTimestamp (std::nullopt, 48'480));
+        }
+
+        beginTest ("Zero is a valid time and frame");
+        {
+            expectTimestamp (getOboeOutputTimestamp (StreamTimestamp { 0, 0 }, 0), { 0, 0, 0 });
+            expectTimestamp (getOboeInputTimestamp (StreamTimestamp { 0, 0 }, 480, 480), { 0, 0, 0 });
+        }
+
+        beginTest ("Large counters keep exact offsets");
+        {
+            expectTimestamp (getOboeOutputTimestamp (StreamTimestamp { 4'000'000'000'000, 9'000'000'000'000'000'000 }, 4'000'000'000'480),
+                             { 9'000'000'000'000'000'000, -480, 0 });
+            expectTimestamp (getOboeInputTimestamp (StreamTimestamp { 4'611'686'018'427'387'904, 1 }, 4'611'686'018'427'387'904, 480),
+                             { 1, 480, 0 });
+        }
+    }
+
+private:
+    void expectTimestamp (const std::optional<AudioIODeviceTimestamp>& actual, const AudioIODeviceTimestamp& expected)
+    {
+        expect (actual.has_value() && isSameTimestamp (*actual, expected), "got " + describe (actual) + ", expected " + describe (expected));
+    }
+
+    void expectAbsent (const std::optional<AudioIODeviceTimestamp>& actual)
+    {
+        expect (! actual.has_value(), "got " + describe (actual) + ", expected absent");
+    }
+};
+
+static OboeStreamTimestampTests oboeStreamTimestampTests;
+
 } // namespace juce::CallbackTimeHelpers

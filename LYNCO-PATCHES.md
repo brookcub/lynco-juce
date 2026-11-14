@@ -576,3 +576,11 @@ New in .6.
 **Limits:** A libjack predating `jack_get_cycle_times` gets no role. The value is JACK's prediction, not a device or kernel timestamp. A server whose clock matches neither MONOTONIC nor RAW within 1 ms gets no role. Under heavy host overload JACK's prediction itself can step; that is the server's value and is forwarded unchanged.
 
 New in .6. Revised before publication: the first draft checked once per activation that `jack_get_time()` agreed with CLOCK_MONOTONIC within 1 ms, and so left the role absent on every jackd2. Replaced in place by the per-callback rule below (SPEC "JACK clock: ruling 8 replaced").
+
+### P024: Android file flushes no longer leak JNI global references
+
+- **Files:** `modules/juce_core/native/juce_Files_android.cpp`.
+- **Why:** `FileOutputStream::flushInternal()` created a `SingleMediaScanner` on every flush and never deleted it. The object's own `invocationHandler` global reference kept its Java handler reachable, so the finalizer that would delete it never ran. Each flush leaked three JNI global references (`javaSubClass`, `invocationHandler`, `msc`). A process that flushes often overflows ART's global reference table (about 51,200 entries) and aborts: a stream flushed every 2 s exhausts it in about 9.5 h, and several such streams proportionally sooner.
+- **Change:** the flush still runs `fsync` and still asks the media scanner to rescan the file, as upstream does, but through the static `MediaScannerConnection.scanFile (Context, String[], String[], OnScanCompletedListener)` with no listener. That call creates no native proxy and holds no global reference. A Java exception from the call is cleared. `SingleMediaScanner`, `MediaScannerConnectionClient` and the unused instance members of the `MediaScannerConnection` JNI class are removed; they had no other users.
+- **Default behaviour:** unchanged apart from the leak: the same file is scanned after every flush. Apps that do not flush are unaffected.
+- **Verification:** Android arm64 compile of `juce_core.cpp` (NDK 28.1.13356709, API 29, `-std=c++20 -Wall -Wshadow-all -Wunused-function`): no diagnostics. Device: a debuggable app that flushes repeatedly shows JNI global references (`adb shell debuggerd -j <pid> | grep -i globals=`) rising about 3 per flush without the patch and flat with it.

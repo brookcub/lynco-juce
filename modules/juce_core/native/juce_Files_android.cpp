@@ -36,10 +36,7 @@ namespace juce
 {
 
 #define JNI_CLASS_MEMBERS(METHOD, STATICMETHOD, FIELD, STATICFIELD, CALLBACK) \
-  METHOD (constructor, "<init>",     "(Landroid/content/Context;Landroid/media/MediaScannerConnection$MediaScannerConnectionClient;)V") \
-  METHOD (connect,     "connect",    "()V") \
-  METHOD (disconnect,  "disconnect", "()V") \
-  METHOD (scanFile,    "scanFile",   "(Ljava/lang/String;Ljava/lang/String;)V") \
+  STATICMETHOD (scanFile, "scanFile", "(Landroid/content/Context;[Ljava/lang/String;[Ljava/lang/String;Landroid/media/MediaScannerConnection$OnScanCompletedListener;)V") \
 
 DECLARE_JNI_CLASS (MediaScannerConnection, "android/media/MediaScannerConnection")
 #undef JNI_CLASS_MEMBERS
@@ -752,35 +749,6 @@ private:
 };
 
 //==============================================================================
-class MediaScannerConnectionClient : public AndroidInterfaceImplementer
-{
-public:
-    virtual void onMediaScannerConnected() = 0;
-    virtual void onScanCompleted() = 0;
-
-private:
-    jobject invoke (jobject proxy, jobject method, jobjectArray args) override
-    {
-        auto* env = getEnv();
-
-        auto methodName = juceString ((jstring) env->CallObjectMethod (method, JavaMethod.getName));
-
-        if (methodName == "onMediaScannerConnected")
-        {
-            onMediaScannerConnected();
-            return nullptr;
-        }
-        else if (methodName == "onScanCompleted")
-        {
-            onScanCompleted();
-            return nullptr;
-        }
-
-        return AndroidInterfaceImplementer::invoke (proxy, method, args);
-    }
-};
-
-//==============================================================================
 bool File::isOnCDRomDrive() const
 {
     return false;
@@ -902,37 +870,6 @@ void File::revealToUser() const
 {
 }
 
-//==============================================================================
-class SingleMediaScanner final : public MediaScannerConnectionClient
-{
-public:
-    SingleMediaScanner (const String& filename)
-        : msc (LocalRef<jobject> (getEnv()->NewObject (MediaScannerConnection,
-                                                       MediaScannerConnection.constructor,
-                                                       getAppContext().get(),
-                                                       CreateJavaInterface (this, "android/media/MediaScannerConnection$MediaScannerConnectionClient").get()))),
-          file (filename)
-    {
-        getEnv()->CallVoidMethod (msc.get(), MediaScannerConnection.connect);
-    }
-
-    void onMediaScannerConnected() override
-    {
-        auto* env = getEnv();
-
-        env->CallVoidMethod (msc.get(), MediaScannerConnection.scanFile, javaString (file).get(), 0);
-    }
-
-    void onScanCompleted() override
-    {
-        getEnv()->CallVoidMethod (msc.get(), MediaScannerConnection.disconnect);
-    }
-
-private:
-    GlobalRef msc;
-    String file;
-};
-
 void FileOutputStream::flushInternal()
 {
     if (fileHandle.isValid())
@@ -944,7 +881,11 @@ void FileOutputStream::flushInternal()
         // that the OS has cached about the file - this metadata is used
         // when the device is acting as a USB drive, and unless it's explicitly
         // refreshed, it'll get out of step with the real file.
-        new SingleMediaScanner (file.getFullPathName());
+        auto* env = getEnv();
+        LocalRef<jobjectArray> paths { env->NewObjectArray (1, JavaString, javaString (file.getFullPathName()).get()) };
+        env->CallStaticVoidMethod (MediaScannerConnection, MediaScannerConnection.scanFile,
+                                   getAppContext().get(), paths.get(), nullptr, nullptr);
+        jniCheckHasExceptionOccurredAndClear();
     }
 }
 

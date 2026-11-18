@@ -1662,6 +1662,8 @@ public:
         return fullScreen;
     }
 
+    bool fullScreenBeforeKiosk = false;
+
     void setIcon (const Image& /*newIcon*/) override
     {
         // n/a
@@ -2849,10 +2851,25 @@ bool Desktop::isScreenSaverEnabled()
 //==============================================================================
 void Desktop::setKioskComponent (Component* kioskComp, bool enableOrDisable, [[maybe_unused]] bool allowMenusAndBars)
 {
-    if (AndroidComponentPeer* peer = dynamic_cast<AndroidComponentPeer*> (kioskComp->getPeer()))
-        peer->setFullScreen (enableOrDisable);
-    else
+    auto* peer = dynamic_cast<AndroidComponentPeer*> (kioskComp->getPeer());
+
+    if (peer == nullptr)
+    {
         jassertfalse; // (this should have been checked by the caller)
+        return;
+    }
+
+    if (enableOrDisable)
+        peer->fullScreenBeforeKiosk = peer->isFullScreen();
+
+    // A window that was full screen before kiosk mode stays full screen and only shows the system bars.
+    // Leaving full screen re-adds the view, and the caller's restore of the pre-kiosk bounds would do
+    // the same, so that restore is made a no-op.
+    const auto stayFullScreen = ! enableOrDisable && peer->fullScreenBeforeKiosk;
+    peer->setFullScreen (enableOrDisable || stayFullScreen);
+
+    if (stayFullScreen)
+        kioskComponentOriginalBounds = kioskComp->getBounds();
 }
 
 //==============================================================================

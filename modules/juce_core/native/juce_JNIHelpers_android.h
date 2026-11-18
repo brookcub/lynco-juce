@@ -632,6 +632,7 @@ DECLARE_JNI_CLASS (AndroidUri, "android/net/Uri")
  METHOD (requestFocus,              "requestFocus",              "()Z") \
  METHOD (hasFocus,                  "hasFocus",                  "()Z") \
  METHOD (invalidate,                "invalidate",                "(IIII)V") \
+ METHOD (setWillNotDraw,            "setWillNotDraw",            "(Z)V") \
  METHOD (setVisibility,             "setVisibility",             "(I)V") \
  METHOD (setLayoutParams,           "setLayoutParams",           "(Landroid/view/ViewGroup$LayoutParams;)V") \
  METHOD (getLayoutParams,           "getLayoutParams",           "()Landroid/view/ViewGroup$LayoutParams;") \

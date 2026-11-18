@@ -154,6 +154,14 @@ public:
                              AndroidViewGroup.addView,
                              surfaceView.get());
 
+        // When the surface covers the whole peer, nothing the peer view draws itself can be seen,
+        // so Android is told not to ask it to; otherwise every Android redraw (layout, focus)
+        // paints the whole component tree in software for nothing.
+        coversPeer = &component.getPeer()->getComponent() == &component;
+
+        if (coversPeer)
+            env->CallVoidMethod ((jobject) component.getPeer()->getNativeHandle(), AndroidView.setWillNotDraw, (jboolean) true);
+
         // initialise the geometry of the view
         updateWindowPosition (component.localAreaToGlobal (component.getLocalBounds()));
         hasInitialised = true;
@@ -168,7 +176,12 @@ public:
                 env->CallVoidMethod (holder, AndroidSurfaceHolder.removeCallback, surfaceHolderCallback.get());
 
         if (jobject viewParent = env->CallObjectMethod (surfaceView.get(), JuceOpenGLViewSurface.getParent))
+        {
+            if (coversPeer)
+                env->CallVoidMethod (viewParent, AndroidView.setWillNotDraw, (jboolean) false);
+
             env->CallVoidMethod (viewParent, AndroidViewGroup.removeView, surfaceView.get());
+        }
     }
 
     //==============================================================================
@@ -382,7 +395,7 @@ private:
 
     //==============================================================================
     CriticalSection mutex;
-    bool hasInitialised = false;
+    bool hasInitialised = false, coversPeer = false;
 
     GlobalRef surfaceView;
     Rectangle<int> physicalBounds;

@@ -94,6 +94,21 @@ public:
     /** Returns the ListBox that's being used to show the midi inputs, or nullptr if there isn't one. */
     ListBox* getMidiInputSelectorListBox() const noexcept;
 
+    /** Runs each change to the audio device that the user makes here: the device, its type, sample rate,
+        buffer size, channels, or a reset. It is called on the message thread. When it isn't set, the
+        change runs at once on the message thread.
+
+        Set it to run the change elsewhere, so that a slow device doesn't block the message thread. Call
+        `change` once, then call `done` on the message thread with the String it returned (an error, or
+        empty). Until `done` is called the selector is disabled and doesn't query the manager's audio
+        setup, and nothing else may use the manager either, because it isn't thread-safe. The manager's
+        change messages still arrive while the change runs, so other listeners must not query it until
+        then. The device types' own device-list notifications (a device plugged in or removed) also
+        arrive on the message thread and make the manager read and reopen its device; one that arrives
+        during a change races with it. If the selector is deleted first, calling `done` does nothing.
+    */
+    std::function<void (std::function<String()> change, std::function<void (const String& error)> done)> runDeviceChange;
+
     //==============================================================================
     /** @internal */
     void resized() override;
@@ -107,7 +122,13 @@ private:
     void updateDeviceType();
     void changeListenerCallback (ChangeBroadcaster*) override;
     void updateAllControls();
+    void submitDeviceChange (std::function<String()> change);
+    void finishDeviceChange (const String& error);
 
+    friend class AudioDeviceSettingsPanel;
+
+    bool deviceChangeRunning = false;
+    ScopedMessageBox messageBox;
     std::unique_ptr<ComboBox> deviceTypeDropDown;
     std::unique_ptr<Label> deviceTypeDropDownLabel;
     std::unique_ptr<Component> audioDeviceSettingsComp;

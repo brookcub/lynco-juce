@@ -416,57 +416,56 @@ public:
 
     void updateConfig (bool updateOutputDevice, bool updateInputDevice, bool updateSampleRate, bool updateBufferSize)
     {
-        auto config = setup.manager->getAudioDeviceSetup();
-        String error;
-
-        if (updateOutputDevice || updateInputDevice)
+        const auto chosenName = [] (const std::unique_ptr<ComboBox>& box) -> std::optional<String>
         {
-            if (outputDeviceDropDown != nullptr)
-                config.outputDeviceName = outputDeviceDropDown->getSelectedId() < 0 ? String()
-                                                                                    : outputDeviceDropDown->getText();
+            if (box == nullptr)
+                return {};
 
-            if (inputDeviceDropDown != nullptr)
-                config.inputDeviceName = inputDeviceDropDown->getSelectedId() < 0 ? String()
-                                                                                  : inputDeviceDropDown->getText();
+            return box->getSelectedId() < 0 ? String() : box->getText();
+        };
 
-            if (! type.hasSeparateInputsAndOutputs())
-                config.inputDeviceName = config.outputDeviceName;
+        const auto updateDevice = updateOutputDevice || updateInputDevice;
+        const auto outputName = chosenName (outputDeviceDropDown);
+        const auto inputName = chosenName (inputDeviceDropDown);
+        const auto separateInputsAndOutputs = type.hasSeparateInputsAndOutputs();
+        const auto sampleRate = sampleRateDropDown != nullptr ? sampleRateDropDown->getSelectedId() : 0;
+        const auto bufferSize = bufferSizeDropDown != nullptr ? bufferSizeDropDown->getSelectedId() : 0;
 
-            if (updateInputDevice)
-                config.useDefaultInputChannels = true;
-            else
-                config.useDefaultOutputChannels = true;
+        if (! updateDevice && (updateSampleRate ? sampleRate : bufferSize) <= 0)
+            return;
 
-            error = setup.manager->setAudioDeviceSetup (config, true);
-
-            updateSelectedInput();
-            updateSelectedOutput();
-            updateControlPanelButton();
-            resized();
-        }
-        else if (updateSampleRate)
+        // The controls are read now; the setup they change is read when the change runs.
+        parent.submitDeviceChange ([=, manager = setup.manager]
         {
-            if (sampleRateDropDown->getSelectedId() > 0)
+            auto config = manager->getAudioDeviceSetup();
+
+            if (updateDevice)
             {
-                config.sampleRate = sampleRateDropDown->getSelectedId();
-                error = setup.manager->setAudioDeviceSetup (config, true);
-            }
-        }
-        else if (updateBufferSize)
-        {
-            if (bufferSizeDropDown->getSelectedId() > 0)
-            {
-                config.bufferSize = bufferSizeDropDown->getSelectedId();
-                error = setup.manager->setAudioDeviceSetup (config, true);
-            }
-        }
+                if (outputName.has_value())
+                    config.outputDeviceName = *outputName;
 
-        if (error.isNotEmpty())
-            messageBox = AlertWindow::showScopedAsync (MessageBoxOptions().withIconType (MessageBoxIconType::WarningIcon)
-                                                                          .withTitle (TRANS ("Error when trying to open audio device!"))
-                                                                          .withMessage (error)
-                                                                          .withButton (TRANS ("OK")),
-                                                       nullptr);
+                if (inputName.has_value())
+                    config.inputDeviceName = *inputName;
+
+                if (! separateInputsAndOutputs)
+                    config.inputDeviceName = config.outputDeviceName;
+
+                if (updateInputDevice)
+                    config.useDefaultInputChannels = true;
+                else
+                    config.useDefaultOutputChannels = true;
+            }
+            else if (updateSampleRate)
+            {
+                config.sampleRate = sampleRate;
+            }
+            else if (updateBufferSize)
+            {
+                config.bufferSize = bufferSize;
+            }
+
+            return manager->setAudioDeviceSetup (config, true);
+        });
     }
 
     bool showDeviceControlPanel()
@@ -495,8 +494,7 @@ public:
     {
         if (showDeviceControlPanel())
         {
-            setup.manager->closeAudioDevice();
-            setup.manager->restartLastAudioDevice();
+            resetDevice();
             getTopLevelComponent()->toFront (true);
         }
     }
@@ -521,7 +519,7 @@ public:
             {
                 if (outputChanList == nullptr)
                 {
-                    outputChanList = std::make_unique<ChannelSelectorListBox> (setup, ChannelSelectorListBox::audioOutputType,
+                    outputChanList = std::make_unique<ChannelSelectorListBox> (parent, setup, ChannelSelectorListBox::audioOutputType,
                                                                                TRANS ("(no audio output channels found)"));
                     addAndMakeVisible (outputChanList.get());
                     outputChanLabel = std::make_unique<Label> (String{}, TRANS ("Active output channels:"));
@@ -542,7 +540,7 @@ public:
             {
                 if (inputChanList == nullptr)
                 {
-                    inputChanList = std::make_unique<ChannelSelectorListBox> (setup, ChannelSelectorListBox::audioInputType,
+                    inputChanList = std::make_unique<ChannelSelectorListBox> (parent, setup, ChannelSelectorListBox::audioInputType,
                                                                               TRANS ("(no audio input channels found)"));
                     addAndMakeVisible (inputChanList.get());
                     inputChanLabel = std::make_unique<Label> (String{}, TRANS ("Active input channels:"));
@@ -589,13 +587,18 @@ public:
 
     void changeListenerCallback (ChangeBroadcaster*) override
     {
-        updateAllControls();
+        if (! parent.deviceChangeRunning)
+            updateAllControls();
     }
 
     void resetDevice()
     {
-        setup.manager->closeAudioDevice();
-        setup.manager->restartLastAudioDevice();
+        parent.submitDeviceChange ([manager = setup.manager]
+        {
+            manager->closeAudioDevice();
+            manager->restartLastAudioDevice();
+            return String();
+        });
     }
 
 private:
@@ -764,7 +767,7 @@ private:
         }
         else
         {
-            sampleRateDropDown->clear();
+            sampleRateDropDown->clear (dontSendNotification);
             sampleRateDropDown->onChange = nullptr;
         }
 
@@ -794,7 +797,7 @@ private:
         }
         else
         {
-            bufferSizeDropDown->clear();
+            bufferSizeDropDown->clear (dontSendNotification);
             bufferSizeDropDown->onChange = nullptr;
         }
 
@@ -830,8 +833,9 @@ public:
         };
 
         //==============================================================================
-        ChannelSelectorListBox (const AudioDeviceSetupDetails& setupDetails, BoxType boxType, const String& noItemsText)
-           : ListBox ({}, nullptr), setup (setupDetails), type (boxType), noItemsMessage (noItemsText)
+        ChannelSelectorListBox (AudioDeviceSelectorComponent& selector, const AudioDeviceSetupDetails& setupDetails,
+                                BoxType boxType, const String& noItemsText)
+           : ListBox ({}, nullptr), owner (selector), setup (setupDetails), type (boxType), noItemsMessage (noItemsText)
         {
             refresh();
             setModel (this);
@@ -841,9 +845,13 @@ public:
         void refresh()
         {
             items.clear();
+            activeChannels.clear();
 
             if (auto* currentDevice = setup.manager->getCurrentAudioDevice())
             {
+                const auto config = setup.manager->getAudioDeviceSetup();
+                activeChannels = type == audioInputType ? config.inputChannels : config.outputChannels;
+
                 if (type == audioInputType)
                     items = currentDevice->getInputChannelNames();
                 else if (type == audioOutputType)
@@ -883,23 +891,8 @@ public:
                 g.fillAll (findColour (ListBox::backgroundColourId));
 
                 auto item = items[row];
-                bool enabled = false;
-                auto config = setup.manager->getAudioDeviceSetup();
-
-                if (setup.useStereoPairs)
-                {
-                    if (type == audioInputType)
-                        enabled = config.inputChannels[row * 2] || config.inputChannels[row * 2 + 1];
-                    else if (type == audioOutputType)
-                        enabled = config.outputChannels[row * 2] || config.outputChannels[row * 2 + 1];
-                }
-                else
-                {
-                    if (type == audioInputType)
-                        enabled = config.inputChannels[row];
-                    else if (type == audioOutputType)
-                        enabled = config.outputChannels[row];
-                }
+                const auto enabled = setup.useStereoPairs ? activeChannels[row * 2] || activeChannels[row * 2 + 1]
+                                                          : activeChannels[row];
 
                 auto x = getTickX();
                 auto tickW = (float) height * 0.75f;
@@ -952,10 +945,12 @@ public:
 
     private:
         //==============================================================================
+        AudioDeviceSelectorComponent& owner;
         const AudioDeviceSetupDetails setup;
         const BoxType type;
         const String noItemsMessage;
         StringArray items;
+        BigInteger activeChannels;
 
         static String getNameForChannelPair (const String& name1, const String& name2)
         {
@@ -977,28 +972,31 @@ public:
         {
             jassert (type == audioInputType || type == audioOutputType);
 
-            if (isPositiveAndBelow (row, items.size()))
-            {
-                auto config = setup.manager->getAudioDeviceSetup();
+            if (! isPositiveAndBelow (row, items.size()))
+                return;
 
-                if (setup.useStereoPairs)
+            owner.submitDeviceChange ([details = setup, boxType = type, row]
+            {
+                auto config = details.manager->getAudioDeviceSetup();
+
+                if (details.useStereoPairs)
                 {
                     BigInteger bits;
-                    auto& original = (type == audioInputType ? config.inputChannels
+                    auto& original = (boxType == audioInputType ? config.inputChannels
                                                              : config.outputChannels);
 
                     for (int i = 0; i < 256; i += 2)
                         bits.setBit (i / 2, original[i] || original[i + 1]);
 
-                    if (type == audioInputType)
+                    if (boxType == audioInputType)
                     {
                         config.useDefaultInputChannels = false;
-                        flipBit (bits, row, setup.minNumInputChannels / 2, setup.maxNumInputChannels / 2);
+                        flipBit (bits, row, details.minNumInputChannels / 2, details.maxNumInputChannels / 2);
                     }
                     else
                     {
                         config.useDefaultOutputChannels = false;
-                        flipBit (bits, row, setup.minNumOutputChannels / 2, setup.maxNumOutputChannels / 2);
+                        flipBit (bits, row, details.minNumOutputChannels / 2, details.maxNumOutputChannels / 2);
                     }
 
                     for (int i = 0; i < 256; ++i)
@@ -1006,20 +1004,20 @@ public:
                 }
                 else
                 {
-                    if (type == audioInputType)
+                    if (boxType == audioInputType)
                     {
                         config.useDefaultInputChannels = false;
-                        flipBit (config.inputChannels, row, setup.minNumInputChannels, setup.maxNumInputChannels);
+                        flipBit (config.inputChannels, row, details.minNumInputChannels, details.maxNumInputChannels);
                     }
                     else
                     {
                         config.useDefaultOutputChannels = false;
-                        flipBit (config.outputChannels, row, setup.minNumOutputChannels, setup.maxNumOutputChannels);
+                        flipBit (config.outputChannels, row, details.minNumOutputChannels, details.maxNumOutputChannels);
                     }
                 }
 
-                setup.manager->setAudioDeviceSetup (config, true);
-            }
+                return details.manager->setAudioDeviceSetup (config, true);
+            });
         }
 
         static void flipBit (BigInteger& chans, int index, int minNumber, int maxNumber)
@@ -1053,7 +1051,6 @@ public:
 
 private:
     std::unique_ptr<ChannelSelectorListBox> inputChanList, outputChanList;
-    ScopedMessageBox messageBox;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AudioDeviceSettingsPanel)
 };
@@ -1202,14 +1199,67 @@ void AudioDeviceSelectorComponent::updateDeviceType()
     if (auto* type = deviceManager.getAvailableDeviceTypes() [deviceTypeDropDown->getSelectedId() - 1])
     {
         audioDeviceSettingsComp.reset();
-        deviceManager.setCurrentAudioDeviceType (type->getTypeName(), true);
-        updateAllControls(); // needed in case the type hasn't actually changed
+
+        submitDeviceChange ([manager = &deviceManager, name = type->getTypeName()]
+        {
+            manager->setCurrentAudioDeviceType (name, true);
+            return String();
+        });
     }
 }
 
 void AudioDeviceSelectorComponent::changeListenerCallback (ChangeBroadcaster*)
 {
-    updateAllControls();
+    if (! deviceChangeRunning)
+        updateAllControls();
+}
+
+void AudioDeviceSelectorComponent::submitDeviceChange (std::function<String()> change)
+{
+    if (deviceChangeRunning)
+        return;
+
+    if (runDeviceChange == nullptr)
+    {
+        finishDeviceChange (change());
+        return;
+    }
+
+    deviceChangeRunning = true;
+    setEnabled (false);
+
+    runDeviceChange (std::move (change), [safeThis = SafePointer<AudioDeviceSelectorComponent> (this)] (const String& error)
+    {
+        if (safeThis != nullptr)
+            safeThis->finishDeviceChange (error);
+    });
+}
+
+void AudioDeviceSelectorComponent::finishDeviceChange (const String& error)
+{
+    JUCE_ASSERT_MESSAGE_THREAD
+
+    // Posted, because this can run inside the onChange of a control that the refresh rebuilds.
+    MessageManager::callAsync ([safeThis = SafePointer<AudioDeviceSelectorComponent> (this)]
+    {
+        if (safeThis == nullptr)
+            return;
+
+        safeThis->updateAllControls();
+
+        if (auto* panel = dynamic_cast<AudioDeviceSettingsPanel*> (safeThis->audioDeviceSettingsComp.get()))
+            panel->updateAllControls();
+
+        if (std::exchange (safeThis->deviceChangeRunning, false))
+            safeThis->setEnabled (true);
+    });
+
+    if (error.isNotEmpty())
+        messageBox = AlertWindow::showScopedAsync (MessageBoxOptions().withIconType (MessageBoxIconType::WarningIcon)
+                                                                      .withTitle (TRANS ("Error when trying to open audio device!"))
+                                                                      .withMessage (error)
+                                                                      .withButton (TRANS ("OK")),
+                                                   nullptr);
 }
 
 void AudioDeviceSelectorComponent::updateAllControls()
@@ -1269,5 +1319,351 @@ ListBox* AudioDeviceSelectorComponent::getMidiInputSelectorListBox() const noexc
 {
     return midiInputsList.get();
 }
+
+
+//==============================================================================
+#if JUCE_UNIT_TESTS && (JUCE_WINDOWS || JUCE_LINUX)
+
+namespace detail
+{
+bool dispatchNextMessageOnSystemQueue (bool returnIfNoPendingMessages);
+} // namespace detail
+
+class AudioDeviceSelectorComponentTests final : public UnitTest
+{
+public:
+    AudioDeviceSelectorComponentTests() : UnitTest ("AudioDeviceSelectorComponent", UnitTestCategories::audio) {}
+
+    void runTest() override
+    {
+        Fakes fakes;
+        AudioDeviceManager manager;
+        manager.addAudioDeviceType (std::make_unique<FakeType> (fakes, "Fake", StringArray { "A", "B", "Broken" }));
+        manager.addAudioDeviceType (std::make_unique<FakeType> (fakes, "Other", StringArray { "C", "D" }));
+        const auto initialiseError = manager.initialise (2, 2, nullptr, false);
+
+        EventRecorder events;
+        manager.addAudioCallback (&events);
+
+        auto selector = std::make_unique<AudioDeviceSelectorComponent> (manager, 0, 2, 0, 2, false, false, false, false);
+        selector->setSize (500, 600);
+
+        std::thread worker;
+        String lastError;
+        bool changeFinished = false;
+
+        selector->runDeviceChange = [&] (std::function<String()> change, std::function<void (const String&)> done)
+        {
+            if (worker.joinable())
+                worker.join();
+
+            fakes.changeRunning = true;
+            changeFinished = false;
+
+            worker = std::thread ([&, change = std::move (change), done = std::move (done)]
+            {
+                auto error = change();
+
+                MessageManager::callAsync ([&, error, done]
+                {
+                    fakes.changeRunning = false;
+                    changeFinished = true;
+                    lastError = error;
+                    done ({}); // the error isn't passed on, so that no alert window opens during the test
+                });
+            });
+        };
+
+        const auto finishChange = [&]
+        {
+            expect (pumpUntil ([&] { return changeFinished; }, 5000), "the change finished");
+            pumpFor (50); // the selector's refresh is posted
+        };
+
+        beginTest ("Switching device keeps the message thread running and the selector off the manager");
+        {
+            expect (initialiseError.isEmpty());
+            pumpFor (50);
+            events.clear();
+            fakes.blockOpens = true;
+
+            choose (*selector, "Output:", "B");
+
+            expect (pumpUntil ([&] { return fakes.openStarted.load(); }, 2000), "the open started");
+            expect (! selector->isEnabled());
+
+            bool dispatched = false;
+            MessageManager::callAsync ([&] { dispatched = true; });
+            expect (pumpUntil ([&] { return dispatched; }, 1000), "messages are dispatched while the open is blocked");
+
+            manager.sendChangeMessage();
+            pumpFor (50);
+            selector->createComponentSnapshot (selector->getLocalBounds());
+
+            expect (! selector->isEnabled());
+            expectEquals (fakes.messageThreadQueries.load(), 0);
+
+            fakes.blockOpens = false;
+            fakes.openGate.signal();
+            finishChange();
+
+            expect (selector->isEnabled());
+            expectEquals (fakes.messageThreadQueries.load(), 0);
+            expectEquals (manager.getAudioDeviceSetup().outputDeviceName, String ("B"));
+            expectEquals (findControl<ComboBox> (*selector, "Output:")->getText(), String ("B"));
+            expectEquals (events.get().joinIntoString (","), String ("stopped,aboutToStart"));
+        }
+
+        beginTest ("Channel choices survive an unrelated change");
+        {
+            auto* inputs = findControl<ListBox> (*selector, "Active input channels:");
+            expect (inputs != nullptr);
+            inputs->selectRow (0);
+            inputs->keyPressed (KeyPress (KeyPress::returnKey));
+            finishChange();
+
+            const auto onlySecond = BigInteger (2);
+            expect (manager.getAudioDeviceSetup().inputChannels == onlySecond);
+
+            const auto newRate = manager.getAudioDeviceSetup().sampleRate == 48000.0 ? 44100 : 48000;
+            findControl<ComboBox> (*selector, "Sample rate:")->setSelectedId (newRate, sendNotificationSync);
+            finishChange();
+
+            expectEquals (manager.getAudioDeviceSetup().sampleRate, (double) newRate);
+            expect (manager.getAudioDeviceSetup().inputChannels == onlySecond);
+            expectEquals (findControl<ComboBox> (*selector, "Sample rate:")->getText(), String (newRate) + " Hz");
+            expectEquals (fakes.messageThreadQueries.load(), 0);
+        }
+
+        beginTest ("A failed open is reported and can be retried");
+        {
+            choose (*selector, "Output:", "Broken");
+            finishChange();
+
+            expectEquals (lastError, String ("Broken can't open"));
+            expect (selector->isEnabled());
+            expect (manager.getCurrentAudioDevice() == nullptr);
+            expectEquals (findControl<ComboBox> (*selector, "Output:")->getSelectedId(), -1);
+
+            choose (*selector, "Output:", "A");
+            finishChange();
+
+            expect (lastError.isEmpty());
+            expect (manager.getCurrentAudioDevice() != nullptr);
+            expectEquals (findControl<ComboBox> (*selector, "Output:")->getText(), String ("A"));
+        }
+
+        beginTest ("Selecting none closes the device");
+        {
+            for (auto* label : { "Input:", "Output:" })
+            {
+                auto* box = findControl<ComboBox> (*selector, label);
+
+                if (box->getSelectedId() != -1)
+                {
+                    box->setSelectedId (-1, sendNotificationSync);
+                    finishChange();
+                }
+            }
+
+            expect (lastError.isEmpty());
+            expect (manager.getCurrentAudioDevice() == nullptr);
+            expect (selector->isEnabled());
+        }
+
+        beginTest ("Changing the device type opens that type's device");
+        {
+            choose (*selector, "Audio device type:", "Other");
+            finishChange();
+
+            expectEquals (manager.getCurrentAudioDeviceType(), String ("Other"));
+            expectEquals (manager.getAudioDeviceSetup().outputDeviceName, String ("C"));
+            expectEquals (findControl<ComboBox> (*selector, "Output:")->getText(), String ("C"));
+            expectEquals (fakes.messageThreadQueries.load(), 0);
+        }
+
+        beginTest ("Deleting the selector during a change is safe");
+        {
+            fakes.blockOpens = true;
+            fakes.openStarted = false;
+
+            choose (*selector, "Output:", "D");
+            expect (pumpUntil ([&] { return fakes.openStarted.load(); }, 2000), "the open started");
+
+            selector.reset();
+            fakes.blockOpens = false;
+            fakes.openGate.signal();
+            expect (pumpUntil ([&] { return changeFinished; }, 5000), "the change finished");
+
+            expectEquals (manager.getAudioDeviceSetup().outputDeviceName, String ("D"));
+        }
+
+        worker.join();
+        manager.removeAudioCallback (&events);
+    }
+
+private:
+    struct Fakes
+    {
+        // Counts calls into the fake devices made on the message thread while a change is running.
+        void noteQuery() { if (changeRunning && MessageManager::existsAndIsCurrentThread()) ++messageThreadQueries; }
+
+        std::atomic<bool> changeRunning { false }, blockOpens { false }, openStarted { false };
+        std::atomic<int> messageThreadQueries { 0 };
+        WaitableEvent openGate;
+    };
+
+    struct FakeDevice final : public AudioIODevice
+    {
+        FakeDevice (Fakes& f, const String& deviceName, const String& typeName)
+            : AudioIODevice (deviceName, typeName), fakes (f) {}
+
+        StringArray getOutputChannelNames() override        { fakes.noteQuery(); return { "o1", "o2" }; }
+        StringArray getInputChannelNames() override         { fakes.noteQuery(); return { "i1", "i2" }; }
+        Array<double> getAvailableSampleRates() override    { fakes.noteQuery(); return { 44100.0, 48000.0 }; }
+        Array<int> getAvailableBufferSizes() override       { fakes.noteQuery(); return { 128, 256 }; }
+        int getDefaultBufferSize() override                 { fakes.noteQuery(); return 128; }
+
+        String open (const BigInteger& ins, const BigInteger& outs, double rate, int size) override
+        {
+            if (fakes.blockOpens)
+            {
+                fakes.openStarted = true;
+                fakes.openGate.wait();
+            }
+
+            if (getName() == "Broken")
+                return "Broken can't open";
+
+            inputs = ins;
+            outputs = outs;
+            sampleRate = rate;
+            bufferSize = size;
+            isDeviceOpen = true;
+            return {};
+        }
+
+        void close() override                               { isDeviceOpen = false; }
+        bool isOpen() override                              { return isDeviceOpen; }
+
+        void start (AudioIODeviceCallback* newCallback) override
+        {
+            callback = newCallback;
+            callback->audioDeviceAboutToStart (this);
+        }
+
+        void stop() override
+        {
+            if (auto* c = std::exchange (callback, nullptr))
+                c->audioDeviceStopped();
+        }
+
+        bool isPlaying() override                           { return callback != nullptr; }
+        String getLastError() override                      { return {}; }
+        int getCurrentBufferSizeSamples() override          { fakes.noteQuery(); return bufferSize; }
+        double getCurrentSampleRate() override              { fakes.noteQuery(); return sampleRate; }
+        int getCurrentBitDepth() override                   { return 32; }
+        BigInteger getActiveOutputChannels() const override { return outputs; }
+        BigInteger getActiveInputChannels() const override  { return inputs; }
+        int getOutputLatencyInSamples() override            { return 0; }
+        int getInputLatencyInSamples() override             { return 0; }
+
+        Fakes& fakes;
+        AudioIODeviceCallback* callback = nullptr;
+        BigInteger inputs, outputs;
+        double sampleRate = 0;
+        int bufferSize = 0;
+        bool isDeviceOpen = false;
+    };
+
+    struct FakeType final : public AudioIODeviceType
+    {
+        FakeType (Fakes& f, const String& typeName, StringArray names)
+            : AudioIODeviceType (typeName), fakes (f), deviceNames (std::move (names)) {}
+
+        void scanForDevices() override {}
+        StringArray getDeviceNames (bool) const override    { fakes.noteQuery(); return deviceNames; }
+        int getDefaultDeviceIndex (bool) const override     { return 0; }
+        int getIndexOfDevice (AudioIODevice* d, bool) const override { return deviceNames.indexOf (d->getName()); }
+        bool hasSeparateInputsAndOutputs() const override   { return true; }
+
+        AudioIODevice* createDevice (const String& outputName, const String& inputName) override
+        {
+            return new FakeDevice (fakes, outputName.isNotEmpty() ? outputName : inputName, getTypeName());
+        }
+
+        Fakes& fakes;
+        const StringArray deviceNames;
+    };
+
+    struct EventRecorder final : public AudioIODeviceCallback
+    {
+        void audioDeviceIOCallbackWithContext (const float* const*, int, float* const*, int, int,
+                                               const AudioIODeviceCallbackContext&) override {}
+        void audioDeviceAboutToStart (AudioIODevice*) override { const ScopedLock sl (lock); events.add ("aboutToStart"); }
+        void audioDeviceStopped() override                     { const ScopedLock sl (lock); events.add ("stopped"); }
+
+        void clear()           { const ScopedLock sl (lock); events.clear(); }
+        StringArray get() const { const ScopedLock sl (lock); return events; }
+
+        CriticalSection lock;
+        StringArray events;
+    };
+
+    template <typename Fn>
+    static bool pumpUntil (Fn&& done, int timeoutMs)
+    {
+        const auto end = Time::getMillisecondCounter() + (uint32) timeoutMs;
+
+        while (! done())
+        {
+            if (Time::getMillisecondCounter() > end)
+                return false;
+
+            if (! detail::dispatchNextMessageOnSystemQueue (true))
+                Thread::sleep (1);
+        }
+
+        return true;
+    }
+
+    static void pumpFor (int ms)
+    {
+        const auto end = Time::getMillisecondCounter() + (uint32) ms;
+        pumpUntil ([&] { return Time::getMillisecondCounter() > end; }, ms + 1000);
+    }
+
+    // Finds the control that the label with this text is attached to.
+    template <typename ComponentType>
+    static ComponentType* findControl (Component& root, const String& labelText)
+    {
+        for (auto* child : root.getChildren())
+        {
+            if (auto* label = dynamic_cast<Label*> (child); label != nullptr && label->getText() == labelText)
+                return dynamic_cast<ComponentType*> (label->getAttachedComponent());
+
+            if (auto* found = findControl<ComponentType> (*child, labelText))
+                return found;
+        }
+
+        return nullptr;
+    }
+
+    void choose (Component& root, const String& labelText, const String& itemText)
+    {
+        auto* box = findControl<ComboBox> (root, labelText);
+        expect (box != nullptr, labelText);
+
+        for (int i = 0; i < box->getNumItems(); ++i)
+            if (box->getItemText (i) == itemText)
+                return box->setSelectedId (box->getItemId (i), sendNotificationSync);
+
+        expect (false, "no item " + itemText);
+    }
+};
+
+static AudioDeviceSelectorComponentTests audioDeviceSelectorComponentTests;
+
+#endif
 
 } // namespace juce
